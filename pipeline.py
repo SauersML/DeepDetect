@@ -53,65 +53,117 @@ def installed(mod_name: str) -> bool:
     return pkgutil.find_loader(base) is not None
 
 def ensure_core_packages():
-    hline("[BOOT] Checking & installing Python packages")
-    ensure_pip()
+    import sys, subprocess, pkgutil, importlib, site
+    from pathlib import Path
 
-    # Show pip, python, and cache info
-    try:
-        out = subprocess.check_output([sys.executable, "-m", "pip", "--version"]).decode()
-        log(out.strip(), prefix="[PIP]")
-    except Exception as e:
-        log(f"pip --version failed: {e}", prefix="[PIP]")
+    def _log(s): log(s, prefix="[PIP]")
 
+    # 0) Make sure pip exists
     try:
-        cache_dir = subprocess.check_output([sys.executable, "-m", "pip", "cache", "dir"]).decode().strip()
-        log(f"pip cache: {cache_dir}", prefix="[PIP]")
+        import pip  # noqa
     except Exception:
-        pass
+        _log("ensurepip.bootstrap()")
+        import ensurepip
+        ensurepip.bootstrap()
 
-    # CUDA 12.4 wheels recommended for A40 (Ampere)
-    torch_needed = not installed("torch")
-    if torch_needed:
-        log("Installing PyTorch (CUDA 12.4 wheels) …", prefix="[PIP]")
+    # 1) Force user site to the **front** of sys.path so we prefer user installs
+    try:
+        user_site = site.getusersitepackages()
+    except Exception:
+        user_site = str(Path.home() / ".local" / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages")
+    if user_site in sys.path:
+        sys.path.remove(user_site)
+    sys.path.insert(0, user_site)
+    _log(f"user site: {user_site}")
+    _log(f"python: {sys.executable}")
+
+    # 2) Helpers for version-aware checks
+    try:
+        from importlib.metadata import version, PackageNotFoundError
+    except Exception:
+        from importlib_metadata import version, PackageNotFoundError  # py<3.8 backport
+    from packaging.version import Version
+
+    def needs(pkg: str, minver: str) -> bool:
+        try:
+            v = version(pkg)
+            return Version(v) < Version(minver)
+        except PackageNotFoundError:
+            return True
+
+    def pip_install(pkgs, index_url=None):
+        cmd = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--user", "-U"]
+        if index_url:
+            cmd += ["--index-url", index_url]
+        cmd += pkgs
+        env = os.environ.copy()
+        env["PIP_PROGRESS_BAR"] = "on"
+        env.pop("PYTHONNOUSERSITE", None)
+        _log(" ".join(cmd))
+        rc = subprocess.call(cmd, env=env)
+        if rc != 0:
+            raise RuntimeError(f"pip install failed: {pkgs}")
+
+    # 3) Torch stack (CUDA 12.4 wheels for A40)
+    if needs("torch", "2.4.0"):
+        _log("Installing/Upgrading torch torchvision torchaudio (CUDA 12.4)…")
         pip_install(["torch", "torchvision", "torchaudio"], index_url="https://download.pytorch.org/whl/cu124")
     else:
-        log("torch already present", prefix="[PIP]")
+        _log("torch OK")
 
-    needed = [
-        "tqdm>=4.66.0",
-        "transformers>=4.44.0",   # Gemma 3
-        "datasets>=2.20.0",
-        "accelerate>=0.33.0",
-        "peft>=0.12.0",           # LoRA/QLoRA
-        "bitsandbytes>=0.43.1",   # 4/8-bit on Ampere
-        "evaluate>=0.4.2",
-        "scikit-learn>=1.4.0",
-        "huggingface_hub>=0.24.0",
-        "sentencepiece>=0.1.99",
-        "tiktoken>=0.7.0",
-        "wandb>=0.17.0",
-    ]
-    to_install = [p for p in needed if not installed(p)]
+    # 4) Core stack with minimum versions
+    reqs = {
+        "transformers":  "4.44.0",  # BitsAndBytesConfig export
+        "datasets":      "2.20.0",
+        "accelerate":    "0.33.0",
+        "peft":          "0.12.0",
+        "bitsandbytes":  "0.43.1",
+        "evaluate":      "0.4.2",
+        "scikit-learn":  "1.4.0",
+        "huggingface_hub":"0.24.0",
+        "sentencepiece": "0.1.99",
+        "tiktoken":      "0.7.0",
+        "tqdm":          "4.66.0",
+        "wandb":         "0.17.0",
+    }
+    to_install = [f"{k}>={v}" for k, v in reqs.items() if needs(k, v)]
     if to_install:
-        log(f"Installing: {to_install}", prefix="[PIP]")
+        _log(f"Installing/Upgrading: {to_install}")
         pip_install(to_install)
     else:
-        log("All core packages already installed", prefix="[PIP]")
+        _log("All core packages satisfy min versions")
 
-    # Version snapshot
+    # 5) Purge any already-imported old modules so re-import picks up user site
+    for mod in ("transformers", "datasets", "accelerate", "peft", "bitsandbytes"):
+        if mod in sys.modules:
+            del sys.modules[mod]
+
+    # 6) Snapshot versions + where they're imported from
     try:
-        import torch, transformers, datasets, peft, accelerate, huggingface_hub, bitsandbytes, tqdm as _tqdm
-        log(f"python        {sys.version.split()[0]}", prefix="[VERS]")
-        log(f"torch         {torch.__version__}", prefix="[VERS]")
-        log(f"transformers  {transformers.__version__}", prefix="[VERS]")
-        log(f"datasets      {datasets.__version__}", prefix="[VERS]")
-        log(f"peft          {peft.__version__}", prefix="[VERS]")
-        log(f"accelerate    {accelerate.__version__}", prefix="[VERS]")
-        log(f"huggingface_hub {huggingface_hub.__version__}", prefix="[VERS]")
-        log(f"bitsandbytes  {bitsandbytes.__version__}", prefix="[VERS]")
-        log(f"tqdm          {_tqdm.__version__}", prefix="[VERS]")
+        import transformers, datasets, peft, accelerate, bitsandbytes, torch
+        _log(f"python        {sys.version.split()[0]}")
+        _log(f"torch         {torch.__version__}")
+        _log(f"transformers  {transformers.__version__} @ {Path(transformers.__file__).resolve()}")
+        _log(f"datasets      {datasets.__version__} @ {Path(datasets.__file__).resolve()}")
+        _log(f"peft          {peft.__version__} @ {Path(peft.__file__).resolve()}")
+        _log(f"accelerate    {accelerate.__version__} @ {Path(accelerate.__file__).resolve()}")
+        _log(f"bitsandbytes  {bitsandbytes.__version__} @ {Path(bitsandbytes.__file__).resolve()}")
     except Exception as e:
-        log(f"Version snapshot failed: {e}", prefix="[VERS]")
+        _log(f"Version snapshot failed: {e}")
+
+    # 7) Hard sanity: ensure BitsAndBytesConfig is importable
+    try:
+        try:
+            from transformers import BitsAndBytesConfig  # noqa
+        except Exception:
+            from transformers.utils.quantization_config import BitsAndBytesConfig  # noqa
+        _log("BitsAndBytesConfig import OK")
+    except Exception as e:
+        _log(f"FATAL: BitsAndBytesConfig not importable ({e}). "
+             f"This means an old 'transformers' is still being imported. "
+             f"sys.path[0]={sys.path[0]}; transformers file="
+             f"{getattr(importlib.import_module('transformers'),'__file__', '??')}")
+        raise
 
 # ---------------------------
 # [C] ENV & CACHE

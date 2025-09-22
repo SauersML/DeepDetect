@@ -1,87 +1,173 @@
-import sys, os, subprocess, pkgutil
+import os, sys, time, json, math, re, gc, argparse, importlib, pkgutil, subprocess
+from pathlib import Path
+from typing import Any, Dict
 
-def pip_install(args):
-    # Install into user site-packages to avoid needing root
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", "-qU"] + args)
+# ---------------------------
+# [A] SUPER-VERBOSE LOGGING
+# ---------------------------
+def log(msg: str = "", *, prefix: str = "", end: str = "\n"):
+    if prefix:
+        print(f"{prefix} {msg}", flush=True, end=end)
+    else:
+        print(msg, flush=True, end=end)
 
-# Ensure pip exists
-try:
-    import pip  # noqa: F401
-except Exception:
-    import ensurepip
-    ensurepip.bootstrap()
-    pip_install(["pip", "setuptools", "wheel"])
+def hline(txt=""):
+    log("=" * 80)
+    if txt:
+        log(txt)
+        log("=" * 80)
 
-# Install CUDA-enabled PyTorch for Ampere (A40) – CUDA 12.4 wheels
-try:
-    import torch  # noqa: F401
-except Exception:
-    pip_install(["--index-url", "https://download.pytorch.org/whl/cu124",
-                 "torch", "torchvision", "torchaudio"])
-    import torch  # re-import after install
-
-# Core ML/NLP stack
-needed = [
-    "transformers>=4.44.0",   # Gemma 3 support
-    "datasets>=2.20.0",
-    "accelerate>=0.33.0",
-    "peft>=0.12.0",           # LoRA / QLoRA
-    "bitsandbytes>=0.43.1",   # 4/8-bit
-    "evaluate>=0.4.2",
-    "scikit-learn>=1.4.0",
-    "huggingface_hub>=0.24.0",
-    "sentencepiece>=0.1.99",  # tokenizer fallback
-    "tiktoken>=0.7.0",        # Gemma 3 tokenization path
-    "wandb>=0.17.0",          # tracking (optional but recommended)
-]
-to_install = [p for p in needed if not pkgutil.find_loader(p.split(">=")[0].split("[")[0])]
-if to_install:
-    pip_install(to_install)
-
-# (Optional) silence bitsandbytes banner + prefer CUDA path
-os.environ.setdefault("BITSANDBYTES_NOWELCOME", "1")
-
-# (Optional) Login to HF Hub if token is already set in env
-if "HF_TOKEN" in os.environ:
+# ---------------------------
+# [B] PIP BOOTSTRAP (LOUD)
+# ---------------------------
+def ensure_pip():
     try:
-        from huggingface_hub import login
-        login(token=os.environ["HF_TOKEN"])
+        import pip  # noqa
+        return True
+    except Exception:
+        log("[BOOT] ensurepip.bootstrap()", prefix="→")
+        import ensurepip
+        ensurepip.bootstrap()
+        return True
+
+def pip_install(pkgs, index_url=None):
+    """Install packages to user site with visible progress."""
+    cmd = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--user", "-U"]
+    if index_url:
+        cmd += ["--index-url", index_url]
+    cmd += pkgs
+    env = os.environ.copy()
+    # force visible progress
+    env["PIP_PROGRESS_BAR"] = "on"
+    env.pop("PYTHONNOUSERSITE", None)
+    log(" ".join(cmd), prefix="[PIP]")
+    # stream output so the user sees progress in real-time
+    proc = subprocess.Popen(cmd, env=env)
+    rc = proc.wait()
+    if rc != 0:
+        raise RuntimeError(f"pip install failed for: {pkgs}")
+    return True
+
+def installed(mod_name: str) -> bool:
+    base = mod_name.split(">=")[0].split("[")[0]
+    return pkgutil.find_loader(base) is not None
+
+def ensure_core_packages():
+    hline("[BOOT] Checking & installing Python packages")
+    ensure_pip()
+
+    # Show pip, python, and cache info
+    try:
+        out = subprocess.check_output([sys.executable, "-m", "pip", "--version"]).decode()
+        log(out.strip(), prefix="[PIP]")
     except Exception as e:
-        print(f"[WARN] HF login failed: {e}")
+        log(f"pip --version failed: {e}", prefix="[PIP]")
 
-# Sanity check GPU
-import torch
-assert torch.cuda.is_available(), "CUDA not visible—did you srun with --gres=gpu and the interactive-gpu partition?"
-print("CUDA OK:", torch.cuda.is_available(), torch.cuda.get_device_name(0))
-# -----------------------------------------------------------------------------
+    try:
+        cache_dir = subprocess.check_output([sys.executable, "-m", "pip", "cache", "dir"]).decode().strip()
+        log(f"pip cache: {cache_dir}", prefix="[PIP]")
+    except Exception:
+        pass
+
+    # CUDA 12.4 wheels recommended for A40 (Ampere)
+    torch_needed = not installed("torch")
+    if torch_needed:
+        log("Installing PyTorch (CUDA 12.4 wheels) …", prefix="[PIP]")
+        pip_install(["torch", "torchvision", "torchaudio"], index_url="https://download.pytorch.org/whl/cu124")
+    else:
+        log("torch already present", prefix="[PIP]")
+
+    needed = [
+        "tqdm>=4.66.0",
+        "transformers>=4.44.0",   # Gemma 3
+        "datasets>=2.20.0",
+        "accelerate>=0.33.0",
+        "peft>=0.12.0",           # LoRA/QLoRA
+        "bitsandbytes>=0.43.1",   # 4/8-bit on Ampere
+        "evaluate>=0.4.2",
+        "scikit-learn>=1.4.0",
+        "huggingface_hub>=0.24.0",
+        "sentencepiece>=0.1.99",
+        "tiktoken>=0.7.0",
+        "wandb>=0.17.0",
+    ]
+    to_install = [p for p in needed if not installed(p)]
+    if to_install:
+        log(f"Installing: {to_install}", prefix="[PIP]")
+        pip_install(to_install)
+    else:
+        log("All core packages already installed", prefix="[PIP]")
+
+    # Version snapshot
+    try:
+        import torch, transformers, datasets, peft, accelerate, huggingface_hub, bitsandbytes, tqdm as _tqdm
+        log(f"python        {sys.version.split()[0]}", prefix="[VERS]")
+        log(f"torch         {torch.__version__}", prefix="[VERS]")
+        log(f"transformers  {transformers.__version__}", prefix="[VERS]")
+        log(f"datasets      {datasets.__version__}", prefix="[VERS]")
+        log(f"peft          {peft.__version__}", prefix="[VERS]")
+        log(f"accelerate    {accelerate.__version__}", prefix="[VERS]")
+        log(f"huggingface_hub {huggingface_hub.__version__}", prefix="[VERS]")
+        log(f"bitsandbytes  {bitsandbytes.__version__}", prefix="[VERS]")
+        log(f"tqdm          {_tqdm.__version__}", prefix="[VERS]")
+    except Exception as e:
+        log(f"Version snapshot failed: {e}", prefix="[VERS]")
 
 # ---------------------------
-# [0] Paths, caches, env hardening
+# [C] ENV & CACHE
 # ---------------------------
-HOME = os.path.expanduser("~")
-os.environ["PATH"] = f"{HOME}/.local/bin:" + os.environ.get("PATH", "")
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+def setup_env_and_caches():
+    from shutil import disk_usage
 
-TMPDIR = os.environ.get("TMPDIR") or f"/tmp/{os.environ.get('USER','user')}"
-HF_HOME = f"{TMPDIR}/hf_home"
-HF_HUB_CACHE = f"{TMPDIR}/hf_hub"
-HF_DATASETS_CACHE = f"{TMPDIR}/hf_datasets"
-for d in (HF_HOME, HF_HUB_CACHE, HF_DATASETS_CACHE):
-    Path(d).mkdir(parents=True, exist_ok=True)
-os.environ.update({
-    "HF_HOME": HF_HOME,
-    "HF_HUB_CACHE": HF_HUB_CACHE,
-    "HF_DATASETS_CACHE": HF_DATASETS_CACHE,
-})
+    HOME = os.path.expanduser("~")
+    os.environ["PATH"] = f"{HOME}/.local/bin:" + os.environ.get("PATH", "")
 
-def log(*a, **k): print(*a, **k, flush=True)
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+    os.environ.setdefault("BITSANDBYTES_NOWELCOME", "1")
+    os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+
+    tmp = os.environ.get("TMPDIR") or f"/tmp/{os.environ.get('USER', 'user')}"
+    hf_home = f"{tmp}/hf_home"
+    hf_hub = f"{tmp}/hf_hub"
+    hf_ds  = f"{tmp}/hf_datasets"
+
+    for d in (hf_home, hf_hub, hf_ds):
+        Path(d).mkdir(parents=True, exist_ok=True)
+    os.environ.update({"HF_HOME": hf_home, "HF_HUB_CACHE": hf_hub, "HF_DATASETS_CACHE": hf_ds})
+
+    hline("[ENV] Caches & disk")
+    for p in (Path(hf_home), Path(hf_hub), Path(hf_ds)):
+        try:
+            total, used, free = disk_usage(p)
+            log(f"{p}  (free: {free/1e9:.2f} GB, used: {used/1e9:.2f} GB, total: {total/1e9:.2f} GB)")
+        except Exception:
+            log(f"{p}  (disk usage: n/a)")
+
+    # Enable tqdm-based download progress for HF
+    try:
+        from huggingface_hub.utils import logging as hf_logging
+        hf_logging.set_verbosity_info()
+        log("HuggingFace Hub logging set to INFO (will show download progress)", prefix="[HF]")
+    except Exception:
+        pass
+
+def disable_hf_transfer():
+    """Ensure we use standard tqdm progress (avoid hf_transfer background)."""
+    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+    try:
+        from huggingface_hub import constants, file_download
+        constants.HF_HUB_ENABLE_HF_TRANSFER = False
+        importlib.reload(file_download)
+        log("Fast transfer disabled → standard tqdm progress.", prefix="[HF]")
+    except Exception:
+        log("Fast transfer disabled via env.", prefix="[HF]")
 
 # ---------------------------
-# [1] CLI
+# [D] CLI / CONFIG
 # ---------------------------
 def build_argparser():
-    p = argparse.ArgumentParser(description="Gemma-3 1B PT • MAGE (AI-text detect) with (Q)LoRA")
+    p = argparse.ArgumentParser(description="Gemma-3 1B PT • AI-text detection with (Q)LoRA")
     p.add_argument("--model-id", default="google/gemma-3-1b-pt")
     p.add_argument("--dataset-id", default="yaful/MAGE")
     p.add_argument("--save-dir", default="./outputs/gemma3-1b-pt-mage")
@@ -103,111 +189,87 @@ def build_argparser():
     p.add_argument("--lora-dropout", type=float, default=0.1)
     p.add_argument("--max-train", type=int, default=0, help="0 = use full train")
     p.add_argument("--max-val", type=int, default=0, help="0 = use full val")
-    p.add_argument("--login", action="store_true", help="call huggingface_hub.login() using $HUGGINGFACE_TOKEN")
-    p.add_argument("--resume", action="store_true", help="skip train if best checkpoint exists")
+    p.add_argument("--login", action="store_true", help="login using $HUGGINGFACE_TOKEN or $HF_TOKEN")
+    p.add_argument("--resume", action="store_true", help="skip training if best checkpoint exists")
     p.add_argument("--wandb", action="store_true", help="enable Weights & Biases logging")
-    p.add_argument("--eval-only", action="store_true", help="load best and run eval/predict only")
+    p.add_argument("--eval-only", action="store_true", help="eval best checkpoint only")
     return p
 
 # ---------------------------
-# [2] Torch / GPU probe
+# [E] GPU PROBE
 # ---------------------------
-def gpu_probe():
-    import torch
-    assert torch.cuda.is_available(), "CUDA GPU not visible."
+def gpu_probe(preferred=None):
+    import torch, subprocess
+    assert torch.cuda.is_available(), "CUDA GPU not visible (check --gres=gpu and partition)."
     name = torch.cuda.get_device_name(0)
     cc = ".".join(map(str, torch.cuda.get_device_capability(0)))
     vram = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-    use_bf16 = torch.cuda.is_bf16_supported()
-    dtype = "bf16" if use_bf16 else "fp16"
-    log(f"[GPU] {name} | CC {cc} | VRAM~{vram:.1f} GB | preferred_precision={dtype}")
+    supp_bf16 = torch.cuda.is_bf16_supported()
+    dtype = preferred or ("bf16" if supp_bf16 else "fp16")
+    hline("[GPU] CUDA device")
+    log(f"Name: {name}")
+    log(f"Compute Capability: {cc}")
+    log(f"VRAM: {vram:.1f} GB")
+    log(f"Preferred precision: {dtype}")
     try:
-        out = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True)
-        if out.returncode == 0: log(out.stdout.strip())
+        out = subprocess.check_output(["nvidia-smi", "-L"]).decode()
+        log(out.strip())
     except Exception:
         pass
     return dtype
 
 # ---------------------------
-# [3] Kill hf_transfer in-process (avoids needing hf_transfer pkg)
-# ---------------------------
-def disable_hf_transfer():
-    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
-    try:
-        import huggingface_hub
-        from huggingface_hub import constants, file_download
-        constants.HF_HUB_ENABLE_HF_TRANSFER = False
-        importlib.reload(file_download)
-        log("[HF] Fast transfer disabled (patched module + env).")
-    except Exception:
-        log("[HF] Fast transfer disabled via env; hub not yet imported.")
-
-# ---------------------------
-# [4] Login (optional)
-# ---------------------------
-def maybe_login(do_login: bool):
-    if not do_login: return
-    token = os.environ.get("HUGGINGFACE_TOKEN") or os.environ.get("HF_TOKEN")
-    if not token:
-        log("! --login requested but $HUGGINGFACE_TOKEN not set. Skipping.")
-        return
-    try:
-        from huggingface_hub import login
-        login(token=token, add_to_git_credential=False)
-        log("✓ Hugging Face login ok.")
-    except Exception as e:
-        log(f"! Hugging Face login failed: {e}")
-
-# ---------------------------
-# [5] Seed & small utils
+# [F] SEED
 # ---------------------------
 def set_seed(seed=5541):
     import torch, numpy as np, random as pyrand
-    pyrand.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    pyrand.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.benchmark = True
 
+# ---------------------------
+# [G] DATA (LOUD)
+# ---------------------------
 def json_dump(obj, path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f: json.dump(obj, f, indent=2)
 
-# ---------------------------
-# [6] Data load + cache (tokenized)
-# ---------------------------
 def load_and_tokenize(cfg: Dict[str, Any], save_root: Path, max_train=0, max_val=0):
     disable_hf_transfer()
     from datasets import load_dataset, ClassLabel, DatasetDict, load_from_disk
     from transformers import AutoTokenizer, DataCollatorWithPadding
     from collections import Counter
+    from tqdm.auto import tqdm
 
     cache_dir = save_root / "cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    # Use on-disk tokenized cache keyed by (dataset, model, maxlen)
     key = re.sub(r"[^a-zA-Z0-9_.-]+", "_", f"{cfg['dataset_id']}__{cfg['model_id']}__L{cfg['max_length']}")
     tok_cache = cache_dir / f"tok_{key}"
 
     if tok_cache.exists():
-        log(f"[DATA] Loading tokenized dataset from disk → {tok_cache}")
+        log(f"Loading tokenized dataset from disk → {tok_cache}", prefix="[DATA]")
         ds_tok = load_from_disk(str(tok_cache))
-        # pick metadata back up
         with open(tok_cache / "meta.json") as f:
             meta = json.load(f)
         id2label = {int(k): v for k, v in meta["id2label"].items()}
-        collator = DataCollatorWithPadding(tokenizer=AutoTokenizer.from_pretrained(cfg["model_id"]))
+        tok = AutoTokenizer.from_pretrained(cfg["model_id"], use_fast=True)
+        collator = DataCollatorWithPadding(tokenizer=tok)
         return ds_tok, collator, id2label
 
-    log(f"[DATA] Loading raw dataset: {cfg['dataset_id']}")
+    hline("[DATA] Downloading/reading dataset")
+    t0 = time.time()
     ds = load_dataset(cfg["dataset_id"])
+    log(f"Splits: {list(ds.keys())}")
+    log(f"Train size: {len(ds['train'])}" + (f", Test size: {len(ds['test'])}" if "test" in ds else ""))
 
     # ensure validation split
     keys = set(ds.keys())
     if "validation" not in keys and "val" not in keys:
-        log("[DATA] No validation split → creating 10% from train")
+        log("No validation split → creating 10% from train", prefix="[DATA]")
         split = ds["train"].train_test_split(test_size=0.1, seed=cfg["seed"])
-        ds = DatasetDict(train=split["train"], validation=split["test"], **({"test": ds["test"]} if "test" in keys else {}))
+        from datasets import DatasetDict as HF_DatasetDict
+        ds = HF_DatasetDict(train=split["train"], validation=split["test"], **({"test": ds["test"]} if "test" in keys else {}))
     elif "val" in keys:
         ds = DatasetDict(train=ds["train"], validation=ds["val"], **({"test": ds["test"]} if "test" in keys else {}))
 
@@ -218,9 +280,9 @@ def load_and_tokenize(cfg: Dict[str, Any], save_root: Path, max_train=0, max_val
     text_col = next((c for c in cand_text if c in cols), cols[0])
     label_col = next((c for c in cand_label if c in cols), None)
     assert label_col is not None, f"No label-like column found in {cols}"
-    feat = ds["train"].features.get(label_col)
+    log(f"text_col={text_col} | label_col={label_col}", prefix="[DATA]")
 
-    # normalize labels to {0: HUMAN, 1: AI}
+    feat = ds["train"].features.get(label_col)
     if isinstance(feat, ClassLabel):
         id2label = {i: n.upper() for i, n in enumerate(feat.names)}
     else:
@@ -231,6 +293,7 @@ def load_and_tokenize(cfg: Dict[str, Any], save_root: Path, max_train=0, max_val
             low = {str(x).strip().lower() for x in vals}
             assert low <= {"human","real","ai","gpt","machine"}, f"Unrecognized labels: {vals}"
             id2label = {0:"HUMAN", 1:"AI"}
+    log(f"id2label={id2label}", prefix="[DATA]")
 
     def map_label_value(v):
         if isinstance(v, str):
@@ -239,7 +302,7 @@ def load_and_tokenize(cfg: Dict[str, Any], save_root: Path, max_train=0, max_val
             return {"human":0,"real":0,"ai":1,"gpt":1,"machine":1}[s]
         return int(v)
 
-    # subsample (optional)
+    # subsample
     def maybe_take(ds_split, nmax):
         if nmax and len(ds_split) > nmax:
             return ds_split.shuffle(seed=cfg["seed"]).select(range(nmax))
@@ -247,9 +310,8 @@ def load_and_tokenize(cfg: Dict[str, Any], save_root: Path, max_train=0, max_val
 
     ds["train"] = maybe_take(ds["train"], max_train)
     ds["validation"] = maybe_take(ds["validation"], max_val)
+    log(f"Using: train={len(ds['train'])}, val={len(ds['validation'])}", prefix="[DATA]")
 
-    # tokenizer + map (with progress)
-    from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(cfg["model_id"], use_fast=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
@@ -260,130 +322,120 @@ def load_and_tokenize(cfg: Dict[str, Any], save_root: Path, max_train=0, max_val
         enc["labels"] = [map_label_value(v) for v in batch[label_col]]
         return enc
 
-    log("[DATA] Tokenizing …")
+    log("Tokenizing …", prefix="[DATA]")
+    from datasets import DatasetDict as HF_DatasetDict
     ds_tok = {}
     for split in ds.keys():
-        log(f"  ↳ {split} ({len(ds[split])} rows)")
+        log(f"→ {split} ({len(ds[split])} rows)", prefix="[DATA]")
         ds_tok[split] = ds[split].map(
             tok_fn, batched=True, remove_columns=ds[split].column_names, desc=f"Tokenize[{split}]"
         )
-    from datasets import DatasetDict as HF_DatasetDict
     ds_tok = HF_DatasetDict(**ds_tok)
 
-    # collator & stats
     from transformers import DataCollatorWithPadding
     collator = DataCollatorWithPadding(tokenizer=tok)
     from collections import Counter
     y_counts = Counter(ds_tok["train"]["labels"])
-    log(f"[DATA] Label dist (train): " + str({id2label[k]: v for k, v in sorted(y_counts.items())}))
+    log("Label dist (train): " + str({id2label[k]: v for k, v in sorted(y_counts.items())}), prefix="[DATA]")
 
-    # persist tokenized dataset
-    log(f"[CACHE] Saving tokenized dataset → {tok_cache}")
+    log(f"Saving tokenized dataset → {tok_cache}", prefix="[CACHE]")
     ds_tok.save_to_disk(str(tok_cache))
     json_dump({"id2label": id2label, "text_col": text_col, "label_col": label_col, "max_length": max_len}, tok_cache / "meta.json")
+    log(f"Dataset ready in {time.time()-t0:.1f}s", prefix="[DATA]")
     return ds_tok, collator, id2label
 
 # ---------------------------
-# [7] Model, (Q)LoRA, training
+# [H] TRAIN / EVAL
 # ---------------------------
 def train_eval(cfg: Dict[str, Any]):
-    import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
+    import torch, time
+    import torch.nn as nn, torch.nn.functional as F
     from torch.utils.data import DataLoader
     from tqdm.auto import tqdm
-    from transformers import (
-        AutoModelForCausalLM, BitsAndBytesConfig, get_linear_schedule_with_warmup
-    )
+    from transformers import AutoModelForCausalLM, BitsAndBytesConfig, get_linear_schedule_with_warmup
     from peft import LoraConfig, get_peft_model, PeftModel
     import bitsandbytes as bnb
-    from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 
     device = torch.device("cuda")
     save_root = Path(cfg["save_dir"]); save_root.mkdir(parents=True, exist_ok=True)
     best_dir = save_root / "best"
 
-    # data
+    # Data
     ds_tok, collator, id2label = load_and_tokenize(cfg, save_root, cfg["max_train"], cfg["max_val"])
     train_dl = DataLoader(ds_tok["train"], batch_size=cfg["batch_size"], shuffle=True, collate_fn=collator, pin_memory=True)
     val_bs = max(1, cfg["batch_size"] * 2)
     val_dl = DataLoader(ds_tok["validation"], batch_size=val_bs, shuffle=False, collate_fn=collator, pin_memory=True)
 
-    # early exit if eval-only or resume:
+    # Early paths
     if cfg["eval_only"] and not best_dir.exists():
-        log("! --eval-only requested but no best checkpoint found. Exiting."); return
+        log("eval-only requested but no checkpoint found → exit", prefix="[EVAL]")
+        return
     if cfg["resume"] and best_dir.exists() and not cfg["eval_only"]:
-        log("✓ Best checkpoint exists and --resume set. Skipping training and running eval.")
+        log("best checkpoint exists and --resume set → evaluate only", prefix="[EVAL]")
         return evaluate_and_save(cfg, best_dir, ds_tok, val_dl, collator, id2label)
 
-    # precision
-    auto_prec = gpu_probe()
-    if cfg["precision"] is None: cfg["precision"] = auto_prec
-    torch.set_float32_matmul_precision("medium")
+    # Precision & GPU info
+    import torch as _t
+    if cfg["precision"] is None:
+        cfg["precision"] = "bf16" if _t.cuda.is_bf16_supported() else "fp16"
+    _t.set_float32_matmul_precision("medium")
+    log(f"Precision: {cfg['precision']}", prefix="[TRAIN]")
 
-    # bitsandbytes availability check
+    # Quantization choice
+    base_dtype = _t.bfloat16 if cfg["precision"] == "bf16" else _t.float16
     bnb_ok = False
     try:
         ver = tuple(int(x) for x in re.findall(r"\d+", bnb.__version__)[:3])
-        bnb_ok = ver >= (0, 42, 0)  # safe for 4-bit + PEFT adapter injection
-        log(f"[BNB] bitsandbytes {bnb.__version__} | 4-bit LoRA {'enabled' if bnb_ok else 'disabled (fallback)'}")
+        bnb_ok = ver >= (0, 42, 0)
     except Exception:
-        log("[BNB] bitsandbytes version parse failed; disabling 4-bit.")
-
-    # try load in 4-bit, else 8-bit, else full precision
+        pass
     quant = None
-    base_dtype = torch.bfloat16 if cfg["precision"] == "bf16" else torch.float16
     if bnb_ok:
         quant = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
                                    bnb_4bit_compute_dtype=base_dtype, bnb_4bit_use_double_quant=True)
-    elif hasattr(bnb.nn, "Linear8bitLt"):
-        quant = BitsAndBytesConfig(load_in_8bit=True)
+        log("Quantization: 4-bit NF4", prefix="[MODEL]")
+    else:
+        log("Quantization: disabled (bitsandbytes not OK)", prefix="[MODEL]")
 
-    log(f"[MODEL] Loading {cfg['model_id']} (quant={'4-bit' if (quant and quant.load_in_4bit) else '8-bit' if (quant and getattr(quant,'load_in_8bit',False)) else 'none'}, dtype={cfg['precision']})")
-    t_load = time.time()
+    # Model load (progress printed by HF/transformers)
+    t0 = time.time()
+    log(f"Loading base model: {cfg['model_id']}", prefix="[MODEL]")
     try:
         base = AutoModelForCausalLM.from_pretrained(
-            cfg["model_id"],
-            quantization_config=quant,
-            dtype=base_dtype if quant is None else None,
-            device_map={"": 0},
+            cfg["model_id"], quantization_config=quant, dtype=None if quant else base_dtype, device_map={"":0}
         )
     except Exception as e:
-        log(f"! 1st attempt failed ({e}). Retrying without quantization…")
-        base = AutoModelForCausalLM.from_pretrained(
-            cfg["model_id"], dtype=base_dtype, device_map={"": 0}
-        )
+        log(f"First attempt failed ({e}) → retry no-quant", prefix="[MODEL]")
+        base = AutoModelForCausalLM.from_pretrained(cfg["model_id"], dtype=base_dtype, device_map={"":0})
     base.config.output_hidden_states = True
     base.config.use_cache = False
     if hasattr(base, "gradient_checkpointing_enable"):
         base.gradient_checkpointing_enable()
     hidden_size = getattr(base.config, "hidden_size", None) or getattr(base.config, "hidden_dim", None)
-    assert hidden_size, "Could not infer hidden size from model config."
-    log(f"    ↳ loaded in {time.time()-t_load:.1f}s | hidden_size={hidden_size}")
+    assert hidden_size, "Could not infer hidden size."
+    log(f"Model loaded in {time.time()-t0:.1f}s | hidden_size={hidden_size}", prefix="[MODEL]")
 
-    # LoRA
+    # LoRA adapters
     backbone = base
     if cfg["use_lora"]:
-        lora_cfg = LoraConfig(
+        log("Injecting LoRA adapters", prefix="[LoRA]")
+        from peft import LoraConfig, get_peft_model
+        lcfg = LoraConfig(
             r=cfg["lora_r"], lora_alpha=cfg["lora_alpha"], lora_dropout=cfg["lora_dropout"],
             target_modules=cfg["target_mods"].split(","), bias="none", task_type="CAUSAL_LM",
         )
-        log("[LoRA] Injecting adapters …")
         try:
-            backbone = get_peft_model(base, lora_cfg)
+            backbone = get_peft_model(base, lcfg)
             backbone.print_trainable_parameters()
         except AttributeError as e:
-            # fallback: no quantization injection oddities
-            log(f"! PEFT inject hit {type(e).__name__}: {e} → retry with dequantized base.")
+            log(f"LoRA injection fallback: {e} → reload base full-precision", prefix="[LoRA]")
             base = AutoModelForCausalLM.from_pretrained(cfg["model_id"], dtype=base_dtype, device_map={"":0})
-            base.config.output_hidden_states = True
-            base.config.use_cache = False
-            if hasattr(base, "gradient_checkpointing_enable"):
-                base.gradient_checkpointing_enable()
-            backbone = get_peft_model(base, lora_cfg)
+            base.config.output_hidden_states = True; base.config.use_cache = False
+            if hasattr(base, "gradient_checkpointing_enable"): base.gradient_checkpointing_enable()
+            backbone = get_peft_model(base, lcfg)
             backbone.print_trainable_parameters()
 
-    # light seq-classifier head on pooled last hidden state
+    # Lightweight classifier on pooled last hidden state
     class SeqClassifier(nn.Module):
         def __init__(self, backbone, hidden, num_labels=2, dropout=0.1):
             super().__init__()
@@ -394,7 +446,7 @@ def train_eval(cfg: Dict[str, Any]):
         def forward(self, input_ids=None, attention_mask=None, labels=None):
             out = self.backbone(input_ids=input_ids, attention_mask=attention_mask,
                                 output_hidden_states=True, use_cache=False, return_dict=True)
-            h = out.hidden_states[-1]  # [B,T,H]
+            h = out.hidden_states[-1]
             if attention_mask is None:
                 pooled = h[:, -1]
             else:
@@ -406,24 +458,23 @@ def train_eval(cfg: Dict[str, Any]):
 
     model = SeqClassifier(backbone, hidden_size, num_labels=2).to(device)
 
-    # optim + sched
+    # Optim & sched
     steps_per_epoch = math.ceil(len(train_dl) / cfg["grad_accum"])
     total_steps = steps_per_epoch * cfg["epochs"]
     warmup_steps = int(total_steps * cfg["warmup_ratio"])
-    opt = bnb.optim.PagedAdamW8bit(
-        model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"], betas=(0.9, 0.95), eps=1e-8
-    )
+    opt = bnb.optim.PagedAdamW8bit(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"], betas=(0.9,0.95), eps=1e-8)
     sch = get_linear_schedule_with_warmup(opt, warmup_steps, total_steps)
     scaler = torch.cuda.amp.GradScaler(enabled=(cfg["precision"] == "fp16"))
 
-    # (optional) W&B
+    # W&B
     if cfg["wandb"]:
         import wandb
         wandb.init(project="deepfake-detect-gemma3", config=cfg, name="gemma3-1b-pt_qLoRA_seqcls")
 
-    # eval util
+    # Eval util
     @torch.no_grad()
     def evaluate(model: nn.Module, loader) -> Dict[str, Any]:
+        from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
         model.eval()
         total_loss, nb = 0.0, 0
         ys, yps, yhats = [], [], []
@@ -439,25 +490,19 @@ def train_eval(cfg: Dict[str, Any]):
                 logits = out["logits"].float()
             prob_ai = torch.softmax(logits, dim=-1)[:, 1]
             pred = logits.argmax(-1)
-            total_loss += float(loss.item())
-            nb += 1
+            total_loss += float(loss.item()); nb += 1
             ys.append(labels.cpu()); yps.append(prob_ai.cpu()); yhats.append(pred.cpu())
             pbar.set_postfix({"loss": f"{total_loss/max(1,nb):.4f}"})
-        import numpy as np
-        y = torch.cat(ys).numpy()
-        p = torch.cat(yps).numpy()
-        yhat = torch.cat(yhats).numpy()
-        from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
-        acc = accuracy_score(y, yhat)
-        f1m = f1_score(y, yhat, average="macro")
-        try:
-            auc = roc_auc_score(y, p)
-        except Exception:
-            auc = float("nan")
+        import numpy as np, torch as _t
+        y = _t.cat(ys).numpy(); p = _t.cat(yps).numpy(); yhat = _t.cat(yhats).numpy()
+        acc = accuracy_score(y, yhat); f1m = f1_score(y, yhat, average="macro")
+        try: auc = roc_auc_score(y, p)
+        except Exception: auc = float("nan")
         return {"loss": total_loss / max(1, nb), "acc": acc, "f1_macro": f1m, "auroc": auc}
 
-    # train
-    log(f"[TRAIN] epochs={cfg['epochs']} | steps/epoch≈{steps_per_epoch} | total_steps={total_steps} | warmup={warmup_steps}")
+    # Train
+    hline("[TRAIN] Start")
+    log(f"epochs={cfg['epochs']} | steps/epoch≈{steps_per_epoch} | total_steps={total_steps} | warmup={warmup_steps}", prefix="[TRAIN]")
     best_f1 = -1.0
     t0 = time.time()
 
@@ -485,10 +530,10 @@ def train_eval(cfg: Dict[str, Any]):
             if step % cfg["grad_accum"] == 0:
                 if cfg["precision"] == "fp16":
                     scaler.unscale_(opt)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["max_grad_norm"])
+                    nn.utils.clip_grad_norm_(model.parameters(), cfg["max_grad_norm"])
                     scaler.step(opt); scaler.update()
                 else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["max_grad_norm"])
+                    nn.utils.clip_grad_norm_(model.parameters(), cfg["max_grad_norm"])
                     opt.step()
                 sch.step()
                 opt.zero_grad(set_to_none=True)
@@ -501,19 +546,19 @@ def train_eval(cfg: Dict[str, Any]):
                     import wandb; wandb.log({"train/loss": avg, "train/lr": sch.get_last_lr()[0]})
                 running = 0.0
 
-        # eval
+        # Eval
         valm = evaluate(model, val_dl)
         elapsed = (time.time() - t0) / 60.0
-        log(f"[EVAL] epoch={epoch} | val_loss={valm['loss']:.4f} | acc={valm['acc']:.4f} | f1_macro={valm['f1_macro']:.4f} | auroc={valm['auroc']:.4f} | time={elapsed:.1f}m")
+        log(f"epoch={epoch} | val_loss={valm['loss']:.4f} | acc={valm['acc']:.4f} | f1_macro={valm['f1_macro']:.4f} | auroc={valm['auroc']:.4f} | time={elapsed:.1f}m", prefix="[EVAL]")
         if cfg["wandb"]:
             import wandb; wandb.log({f"val/{k}": v for k, v in valm.items()} | {"time/min": elapsed})
 
-        # save best by F1
+        # Save best by F1
         if valm["f1_macro"] > best_f1:
             best_f1 = valm["f1_macro"]
             best_dir.mkdir(parents=True, exist_ok=True)
             # 1) save LoRA
-            if isinstance(model.backbone, PeftModel):
+            if hasattr(model.backbone, "save_pretrained"):  # PEFT model
                 model.backbone.save_pretrained(best_dir / "lora_adapter")
             else:
                 backbone.save_pretrained(best_dir / "lora_adapter")
@@ -522,52 +567,47 @@ def train_eval(cfg: Dict[str, Any]):
                 {"state_dict": model.cls.state_dict(), "hidden_size": hidden_size, "num_labels": model.num_labels},
                 best_dir / "classifier.pt",
             )
-            # 3) maps + cfg
+            # 3) metadata
             json_dump(id2label, best_dir / "id2label.json")
             json_dump(cfg, best_dir / "cfg.json")
-            log(f"✓ Saved new best → {best_dir} (f1_macro={best_f1:.4f})")
+            log(f"Saved new best → {best_dir} (f1_macro={best_f1:.4f})", prefix="[SAVE]")
 
         torch.cuda.empty_cache(); gc.collect()
 
-    log("🎉 Training complete.")
+    log("Training complete.", prefix="[TRAIN]")
     evaluate_and_save(cfg, best_dir, ds_tok, val_dl, collator, id2label)
 
 # ---------------------------
-# [8] Reload best, evaluate, and dump predictions
+# [I] EVAL BEST
 # ---------------------------
 def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
-    import torch, json
-    from transformers import AutoModelForCausalLM, BitsAndBytesConfig, AutoTokenizer
-    from peft import PeftModel
+    import torch, numpy as np
     from torch.utils.data import DataLoader
     from tqdm.auto import tqdm
-    import numpy as np
+    from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+    from peft import PeftModel
+    from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 
     assert best_dir.exists(), f"Best dir not found: {best_dir}"
     device = torch.device("cuda")
+    base_dtype = torch.bfloat16 if cfg["precision"] == "bf16" else torch.float16
 
-    # dtype
-    import torch as _torch
-    base_dtype = _torch.bfloat16 if cfg["precision"] == "bf16" else _torch.float16
-
-    # light quant for reload (ok to skip)
+    # Light quant reload
     try:
-        from bitsandbytes import __version__ as _v
         quant = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
                                    bnb_4bit_compute_dtype=base_dtype, bnb_4bit_use_double_quant=True)
     except Exception:
         quant = None
 
-    # model reload
+    log("Reloading best checkpoint …", prefix="[EVAL]")
     base = AutoModelForCausalLM.from_pretrained(cfg["model_id"], quantization_config=quant, dtype=None if quant else base_dtype, device_map={"":0})
     base.config.output_hidden_states = True; base.config.use_cache = False
     peft = PeftModel.from_pretrained(base, best_dir / "lora_adapter")
-    # reconstruct classifier
-    head_state = torch.load(best_dir / "classifier.pt", map_location="cpu")
-    hidden_size = head_state.get("hidden_size")
-    num_labels = head_state.get("num_labels", 2)
 
-    import torch.nn as nn, torch.nn.functional as F
+    head_state = torch.load(best_dir / "classifier.pt", map_location="cpu")
+    hidden_size = head_state.get("hidden_size"); num_labels = head_state.get("num_labels", 2)
+
+    import torch.nn as nn
     class SeqClassifier(nn.Module):
         def __init__(self, backbone, hidden, num_labels=2):
             super().__init__(); self.backbone = backbone; self.cls = nn.Linear(hidden, num_labels)
@@ -581,14 +621,8 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
     model.cls.load_state_dict(head_state["state_dict"])
     model.eval()
 
-    # make/test loader (use same val_dl)
-    if isinstance(val_dl, DataLoader):
-        loader = val_dl
-    else:
-        loader = DataLoader(ds_tok["validation"], batch_size=max(1, cfg["batch_size"]*2), shuffle=False, collate_fn=collator)
+    loader = val_dl if isinstance(val_dl, DataLoader) else DataLoader(ds_tok["validation"], batch_size=max(1, cfg["batch_size"]*2), shuffle=False, collate_fn=collator)
 
-    # eval metrics + write preds
-    from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
     ys, yps, yhats = [], [], []
     pbar = tqdm(loader, desc="Eval(best)", unit="batch", leave=False)
     for batch in pbar:
@@ -606,24 +640,47 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
     acc = accuracy_score(y, yhat); f1m = f1_score(y, yhat, average="macro")
     try: auc = roc_auc_score(y, p)
     except Exception: auc = float("nan")
-    log(f"[BEST] acc={acc:.4f} | f1_macro={f1m:.4f} | auroc={auc:.4f}")
+    log(f"acc={acc:.4f} | f1_macro={f1m:.4f} | auroc={auc:.4f}", prefix="[BEST]")
 
-    # dump predictions
     pred_dir = best_dir / "preds"; pred_dir.mkdir(parents=True, exist_ok=True)
     np.save(pred_dir / "val_labels.npy", y)
     np.save(pred_dir / "val_prob_ai.npy", p)
     np.save(pred_dir / "val_pred.npy", yhat)
     json_dump({"acc": acc, "f1_macro": f1m, "auroc": auc}, pred_dir / "metrics.json")
-    log(f"✓ Saved preds + metrics → {pred_dir}")
+    log(f"Saved preds + metrics → {pred_dir}", prefix="[SAVE]")
 
 # ---------------------------
-# [9] main
+# [J] LOGIN (OPTIONAL)
+# ---------------------------
+def maybe_login(do_login: bool):
+    if not do_login: return
+    token = os.environ.get("HUGGINGFACE_TOKEN") or os.environ.get("HF_TOKEN")
+    if not token:
+        log("--login requested but no $HUGGINGFACE_TOKEN/$HF_TOKEN found; skipping.", prefix="[HF]")
+        return
+    try:
+        from huggingface_hub import login
+        login(token=token, add_to_git_credential=False)
+        log("Hugging Face login ok.", prefix="[HF]")
+    except Exception as e:
+        log(f"HF login failed: {e}", prefix="[HF]")
+
+# ---------------------------
+# [K] MAIN
 # ---------------------------
 def main():
     args = build_argparser().parse_args()
+
+    # 1) Very first: bootstrap deps, env, caches
+    ensure_core_packages()
+    setup_env_and_caches()
+    disable_hf_transfer()
+
+    # 2) GPU probe + precision
     prec = gpu_probe()
     precision = args.precision or prec
 
+    # 3) Config
     cfg = {
         "project": "deepfake-detect-gemma3",
         "model_id": args.model_id,
@@ -650,29 +707,23 @@ def main():
         "eval_only": args.eval_only,
         "resume": args.resume,
     }
+    hline("[CFG]")
+    log(json.dumps(cfg, indent=2))
 
-    # print config
-    log("[CFG]\n" + json.dumps(cfg, indent=2))
-
-    disable_hf_transfer()
+    # 4) HF login (optional)
     maybe_login(args.login)
+
+    # 5) Seed
     set_seed(cfg["seed"])
 
-    # versions snapshot
+    # 6) Train/Eval
     try:
-        import transformers, datasets, peft, accelerate, huggingface_hub, bitsandbytes
-        log(f"[VERS] transformers {transformers.__version__} | datasets {datasets.__version__} | peft {peft.__version__} | accelerate {accelerate.__version__} | hub {huggingface_hub.__version__} | bnb {bitsandbytes.__version__}")
-    except Exception as e:
-        log(f"[VERS] Could not snapshot versions: {e}")
-
-    if args.eval_only or args.resume:
-        # Will run eval only if checkpoint is present; otherwise continue to train.
-        try:
-            train_eval(cfg)
-        except AssertionError as e:
-            log(f"Eval path hit: {e}")
-    else:
         train_eval(cfg)
+    except AssertionError as e:
+        log(f"Assertion error: {e}", prefix="[ERR]")
+    except Exception as e:
+        log(f"Unhandled exception: {e}", prefix="[ERR]")
+        raise
 
 if __name__ == "__main__":
     main()

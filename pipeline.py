@@ -1,6 +1,59 @@
-import os, sys, json, math, time, random, gc, re, argparse, subprocess, importlib
-from pathlib import Path
-from typing import Dict, Any, Optional
+import sys, os, subprocess, pkgutil
+
+def pip_install(args):
+    # Install into user site-packages to avoid needing root
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", "-qU"] + args)
+
+# Ensure pip exists
+try:
+    import pip  # noqa: F401
+except Exception:
+    import ensurepip
+    ensurepip.bootstrap()
+    pip_install(["pip", "setuptools", "wheel"])
+
+# Install CUDA-enabled PyTorch for Ampere (A40) – CUDA 12.4 wheels
+try:
+    import torch  # noqa: F401
+except Exception:
+    pip_install(["--index-url", "https://download.pytorch.org/whl/cu124",
+                 "torch", "torchvision", "torchaudio"])
+    import torch  # re-import after install
+
+# Core ML/NLP stack
+needed = [
+    "transformers>=4.44.0",   # Gemma 3 support
+    "datasets>=2.20.0",
+    "accelerate>=0.33.0",
+    "peft>=0.12.0",           # LoRA / QLoRA
+    "bitsandbytes>=0.43.1",   # 4/8-bit
+    "evaluate>=0.4.2",
+    "scikit-learn>=1.4.0",
+    "huggingface_hub>=0.24.0",
+    "sentencepiece>=0.1.99",  # tokenizer fallback
+    "tiktoken>=0.7.0",        # Gemma 3 tokenization path
+    "wandb>=0.17.0",          # tracking (optional but recommended)
+]
+to_install = [p for p in needed if not pkgutil.find_loader(p.split(">=")[0].split("[")[0])]
+if to_install:
+    pip_install(to_install)
+
+# (Optional) silence bitsandbytes banner + prefer CUDA path
+os.environ.setdefault("BITSANDBYTES_NOWELCOME", "1")
+
+# (Optional) Login to HF Hub if token is already set in env
+if "HF_TOKEN" in os.environ:
+    try:
+        from huggingface_hub import login
+        login(token=os.environ["HF_TOKEN"])
+    except Exception as e:
+        print(f"[WARN] HF login failed: {e}")
+
+# Sanity check GPU
+import torch
+assert torch.cuda.is_available(), "CUDA not visible—did you srun with --gres=gpu and the interactive-gpu partition?"
+print("CUDA OK:", torch.cuda.is_available(), torch.cuda.get_device_name(0))
+# -----------------------------------------------------------------------------
 
 # ---------------------------
 # [0] Paths, caches, env hardening

@@ -51,119 +51,116 @@ def pip_install(pkgs, index_url=None):
 def installed(mod_name: str) -> bool:
     base = mod_name.split(">=")[0].split("[")[0]
     return pkgutil.find_loader(base) is not None
-
 def ensure_core_packages():
-    import sys, subprocess, pkgutil, importlib, site
+    """
+    Fix 'distutils vs setuptools' ordering (Anaconda), then install/upgrade
+    the ML stack into the *user* site and make sure the user site wins on sys.path.
+    Also verifies BitsAndBytesConfig import. Prints verbose locations/versions.
+    """
+    import os, sys, subprocess, importlib, site
     from pathlib import Path
 
-    def _log(s): log(s, prefix="[PIP]")
+    def p(msg): print(f"[PIP] {msg}", flush=True)
 
-    # 0) Make sure pip exists
+    # --- 0) Force setuptools to own distutils (prevents the _distutils_hack warning/assert) ---
+    os.environ.setdefault("SETUPTOOLS_USE_DISTUTILS", "stdlib")
+    # If distutils was already imported by the system Anaconda, purge it so setuptools can re-wire it.
+    for name in list(sys.modules):
+        if name == "distutils" or name.startswith("distutils."):
+            del sys.modules[name]
     try:
-        import pip  # noqa
-    except Exception:
-        _log("ensurepip.bootstrap()")
-        import ensurepip
-        ensurepip.bootstrap()
+        import setuptools  # noqa: F401
+        p("Imported setuptools *before* distutils (good).")
+    except Exception as e:
+        p(f"Could not import setuptools early: {e}")
 
-    # 1) Force user site to the **front** of sys.path so we prefer user installs
+    # --- 1) Ensure pip exists and upgrade pip/setuptools/wheel in user site first ---
+    try:
+        import pip  # noqa: F401
+    except Exception:
+        import ensurepip; ensurepip.bootstrap()
+    def pip_install(args, index_url=None):
+        cmd = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--user", "-U"]
+        if index_url: cmd += ["--index-url", index_url]
+        cmd += args
+        env = os.environ.copy()
+        env["PIP_PROGRESS_BAR"] = "on"
+        env.pop("PYTHONNOUSERSITE", None)  # we DO want user site
+        p(" ".join(cmd))
+        rc = subprocess.call(cmd, env=env)
+        if rc != 0:
+            raise RuntimeError(f"pip failed for: {args}")
+
+    pip_install(["pip", "setuptools", "wheel", "packaging"])
+
+    # --- 2) Make user site take precedence on sys.path (so our upgrades win over system Anaconda) ---
     try:
         user_site = site.getusersitepackages()
     except Exception:
-        user_site = str(Path.home() / ".local" / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages")
-    if user_site in sys.path:
-        sys.path.remove(user_site)
+        user_site = str(Path.home()/".local"/"lib"/f"python{sys.version_info.major}.{sys.version_info.minor}"/"site-packages")
+    if user_site in sys.path: sys.path.remove(user_site)
     sys.path.insert(0, user_site)
-    _log(f"user site: {user_site}")
-    _log(f"python: {sys.executable}")
+    p(f"user site prepended: {user_site}")
+    p(f"python: {sys.executable}")
 
-    # 2) Helpers for version-aware checks
+    # --- 3) Version-aware installs of the ML stack ---
     try:
         from importlib.metadata import version, PackageNotFoundError
     except Exception:
-        from importlib_metadata import version, PackageNotFoundError  # py<3.8 backport
+        from importlib_metadata import version, PackageNotFoundError  # backport
     from packaging.version import Version
+    def needs(pkg, minver):
+        try: return Version(version(pkg)) < Version(minver)
+        except PackageNotFoundError: return True
 
-    def needs(pkg: str, minver: str) -> bool:
-        try:
-            v = version(pkg)
-            return Version(v) < Version(minver)
-        except PackageNotFoundError:
-            return True
-
-    def pip_install(pkgs, index_url=None):
-        cmd = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--user", "-U"]
-        if index_url:
-            cmd += ["--index-url", index_url]
-        cmd += pkgs
-        env = os.environ.copy()
-        env["PIP_PROGRESS_BAR"] = "on"
-        env.pop("PYTHONNOUSERSITE", None)
-        _log(" ".join(cmd))
-        rc = subprocess.call(cmd, env=env)
-        if rc != 0:
-            raise RuntimeError(f"pip install failed: {pkgs}")
-
-    # 3) Torch stack (CUDA 12.4 wheels for A40)
+    # Torch (CUDA 12.4 wheels work on A40)
     if needs("torch", "2.4.0"):
-        _log("Installing/Upgrading torch torchvision torchaudio (CUDA 12.4)…")
+        p("Installing torch/vision/audio (CUDA 12.4)…")
         pip_install(["torch", "torchvision", "torchaudio"], index_url="https://download.pytorch.org/whl/cu124")
     else:
-        _log("torch OK")
+        p("torch OK")
 
-    # 4) Core stack with minimum versions
     reqs = {
-        "transformers":  "4.44.0",  # BitsAndBytesConfig export
-        "datasets":      "2.20.0",
-        "accelerate":    "0.33.0",
-        "peft":          "0.12.0",
-        "bitsandbytes":  "0.43.1",
-        "evaluate":      "0.4.2",
-        "scikit-learn":  "1.4.0",
+        "transformers":   "4.44.0",
+        "datasets":       "2.20.0",
+        "accelerate":     "0.33.0",
+        "peft":           "0.12.0",
+        "bitsandbytes":   "0.43.1",
+        "evaluate":       "0.4.2",
+        "scikit-learn":   "1.4.0",
         "huggingface_hub":"0.24.0",
-        "sentencepiece": "0.1.99",
-        "tiktoken":      "0.7.0",
-        "tqdm":          "4.66.0",
-        "wandb":         "0.17.0",
+        "sentencepiece":  "0.1.99",
+        "tiktoken":       "0.7.0",
+        "tqdm":           "4.66.0",
+        "wandb":          "0.17.0",
     }
     to_install = [f"{k}>={v}" for k, v in reqs.items() if needs(k, v)]
     if to_install:
-        _log(f"Installing/Upgrading: {to_install}")
+        p(f"Installing/Upgrading: {to_install}")
         pip_install(to_install)
     else:
-        _log("All core packages satisfy min versions")
+        p("All core packages satisfy minimum versions.")
 
-    # 5) Purge any already-imported old modules so re-import picks up user site
+    # --- 4) Purge any already-imported old modules; re-import from user site ---
     for mod in ("transformers", "datasets", "accelerate", "peft", "bitsandbytes"):
-        if mod in sys.modules:
-            del sys.modules[mod]
+        if mod in sys.modules: del sys.modules[mod]
 
-    # 6) Snapshot versions + where they're imported from
-    try:
-        import transformers, datasets, peft, accelerate, bitsandbytes, torch
-        _log(f"python        {sys.version.split()[0]}")
-        _log(f"torch         {torch.__version__}")
-        _log(f"transformers  {transformers.__version__} @ {Path(transformers.__file__).resolve()}")
-        _log(f"datasets      {datasets.__version__} @ {Path(datasets.__file__).resolve()}")
-        _log(f"peft          {peft.__version__} @ {Path(peft.__file__).resolve()}")
-        _log(f"accelerate    {accelerate.__version__} @ {Path(accelerate.__file__).resolve()}")
-        _log(f"bitsandbytes  {bitsandbytes.__version__} @ {Path(bitsandbytes.__file__).resolve()}")
-    except Exception as e:
-        _log(f"Version snapshot failed: {e}")
+    # --- 5) Snapshot versions and verify BitsAndBytesConfig is available ---
+    import transformers, datasets, peft, accelerate, bitsandbytes, torch
+    p(f"python        {sys.version.split()[0]}")
+    p(f"torch         {torch.__version__}")
+    p(f"transformers  {transformers.__version__} @ {Path(transformers.__file__).resolve()}")
+    p(f"datasets      {datasets.__version__} @ {Path(datasets.__file__).resolve()}")
+    p(f"peft          {peft.__version__} @ {Path(peft.__file__).resolve()}")
+    p(f"accelerate    {accelerate.__version__} @ {Path(accelerate.__file__).resolve()}")
+    p(f"bitsandbytes  {bitsandbytes.__version__} @ {Path(bitsandbytes.__file__).resolve()}")
 
-    # 7) Hard sanity: ensure BitsAndBytesConfig is importable
+    # This covers both new and older Transformers layouts
     try:
-        try:
-            from transformers import BitsAndBytesConfig  # noqa
-        except Exception:
-            from transformers.utils.quantization_config import BitsAndBytesConfig  # noqa
-        _log("BitsAndBytesConfig import OK")
-    except Exception as e:
-        _log(f"FATAL: BitsAndBytesConfig not importable ({e}). "
-             f"This means an old 'transformers' is still being imported. "
-             f"sys.path[0]={sys.path[0]}; transformers file="
-             f"{getattr(importlib.import_module('transformers'),'__file__', '??')}")
-        raise
+        from transformers import BitsAndBytesConfig  # noqa: F401
+    except Exception:
+        from transformers.utils.quantization_config import BitsAndBytesConfig  # noqa: F401
+    p("BitsAndBytesConfig import OK")
 
 # ---------------------------
 # [C] ENV & CACHE

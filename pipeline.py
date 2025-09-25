@@ -4,6 +4,7 @@
 import os, sys, time, json, math, re, gc, argparse, importlib, pkgutil, subprocess
 from pathlib import Path
 from typing import Any, Dict
+from peft import prepare_model_for_kbit_training
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
@@ -397,6 +398,7 @@ def safe_load_backbone(model_id: str, base_dtype, quant):
         dtype=None if quant else base_dtype,
         device_map={"": 0},
     )
+
 
 def load_and_tokenize(cfg: Dict[str, Any], save_root: Path, max_train=0, max_val=0):
     disable_hf_transfer()

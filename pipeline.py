@@ -1,11 +1,39 @@
 # pip install --upgrade huggingface_hub
 # hf auth login
 
-import os, sys, time, json, math, re, gc, argparse, importlib, pkgutil, subprocess
+import os, sys, time, json, math, re, gc, importlib, pkgutil, subprocess
 from pathlib import Path
 from typing import Any, Dict
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+# Default configuration for pipeline execution. These values mirror the keys
+# injected into ``cfg`` inside ``main`` so that the script can run without
+# requiring external argument parsing or environment mutation.
+DEFAULT_CFG = {
+    "model_id": "sshleifer/tiny-gpt2",
+    "dataset_id": "imdb",
+    "save_dir": "./runs",
+    "seed": 42,
+    "max_length": 256,
+    "epochs": 1,
+    "batch_size": 2,
+    "grad_accum": 1,
+    "lr": 2e-4,
+    "weight_decay": 0.01,
+    "warmup_ratio": 0.03,
+    "max_grad_norm": 1.0,
+    "use_lora": False,
+    "target_mods": "q_proj,k_proj,v_proj,o_proj",
+    "lora_r": 16,
+    "lora_alpha": 32,
+    "lora_dropout": 0.05,
+    "max_train": 20,
+    "max_val": 20,
+    "wandb": False,
+    "eval_only": False,
+    "resume": False,
+}
 
 import contextlib
 
@@ -895,32 +923,7 @@ def main():
     precision = gpu_probe()
 
     # 3) Config
-    cfg = {
-        "project": "deepfake-detect-gemma3",
-        "model_id": model_id,
-        "dataset_id": dataset_id,
-        "save_dir": save_dir,
-        "seed": seed,
-        "precision": precision,
-        "max_length": max_length,
-        "epochs": epochs,
-        "batch_size": batch_size,
-        "grad_accum": grad_accum,
-        "lr": lr,
-        "weight_decay": weight_decay,
-        "warmup_ratio": warmup_ratio,
-        "max_grad_norm": max_grad_norm,
-        "use_lora": use_lora,
-        "target_mods": target_mods,
-        "lora_r": lora_r,
-        "lora_alpha": lora_alpha,
-        "lora_dropout": lora_dropout,
-        "max_train": max_train,
-        "max_val": max_val,
-        "wandb": wandb,
-        "eval_only": eval_only,
-        "resume": resume,
-    }
+    cfg = {"project": "deepfake-detect-gemma3", "precision": precision, **DEFAULT_CFG}
     hline("[CFG]")
     log(json.dumps(cfg, indent=2))
 

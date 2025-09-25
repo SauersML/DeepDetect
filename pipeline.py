@@ -121,7 +121,7 @@ def ensure_core_packages():
         p("torch OK")
 
     reqs = {
-        "transformers":   "4.44.0",
+        "transformers":   "4.56.2",
         "datasets":       "2.20.0",
         "accelerate":     "0.33.0",
         "peft":           "0.12.0",

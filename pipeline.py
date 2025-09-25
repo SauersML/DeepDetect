@@ -344,10 +344,13 @@ def safe_load_tokenizer(model_id: str):
     allow = [
         "tokenizer.json",
         "tokenizer.model",
+        "vocab.json",            # GPT-2 / BPE
+        "merges.txt",            # GPT-2 / BPE
         "special_tokens_map.json",
         "added_tokens.json",
         "tokenizer_config.json",
     ]
+
     _log(f"snapshot_download allow_patterns={allow}")
     snap_dir = snapshot_download(
         repo_id=model_id,
@@ -363,12 +366,16 @@ def safe_load_tokenizer(model_id: str):
             shutil.copy2(src, local_tok_dir / fname)
             present.append(fname)
 
-    # Require at least one real tokenizer file
-    if not any(f in present for f in ("tokenizer.json", "tokenizer.model")):
+    # Require at least one real tokenizer *set*
+    has_sp = ("tokenizer.json" in present) or ("tokenizer.model" in present)
+    has_gpt2_bpe = ("vocab.json" in present) and ("merges.txt" in present)
+    if not (has_sp or has_gpt2_bpe):
         raise RuntimeError(
             f"No tokenizer files found for {model_id}. "
-            f"Looked for: tokenizer.json or tokenizer.model (found: {present})"
+            f"Expected one of: (tokenizer.json) or (tokenizer.model) or (vocab.json + merges.txt). "
+            f"Found: {present}"
         )
+
 
     # 4) Sanitize tokenizer_config.json deterministically
     cfg_path = local_tok_dir / "tokenizer_config.json"

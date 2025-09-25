@@ -261,10 +261,16 @@ def gpu_probe(preferred=None):
     import torch, subprocess
     assert torch.cuda.is_available(), "CUDA GPU not visible (check --gres=gpu and partition)."
     name = torch.cuda.get_device_name(0)
-    cc = ".".join(map(str, torch.cuda.get_device_capability(0)))
+    maj, minr = torch.cuda.get_device_capability(0)
+    cc = f"{maj}.{minr}"
     vram = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-    supp_bf16 = torch.cuda.is_bf16_supported()
-    dtype = preferred or ("bf16" if supp_bf16 else "fp16")
+
+    # Use bf16 only on Ampere+ (SM >= 80). Otherwise use fp16. Do NOT trust is_bf16_supported() on pre-Ampere.
+    if preferred in ("bf16", "fp16"):
+        dtype = preferred
+    else:
+        dtype = "bf16" if maj >= 8 else "fp16"
+
     hline("[GPU] CUDA device")
     log(f"Name: {name}")
     log(f"Compute Capability: {cc}")
@@ -400,6 +406,8 @@ def safe_load_backbone(model_id: str, base_dtype, quant, *, device_map=None, tru
             torch_dtype=(None if quant else base_dtype),
             device_map=device_map,
             trust_remote_code=trust_remote_code,
+            # Gemma-3 prefers eager attention for training
+            attn_implementation="eager",
         )
 
     # training-time prefs
@@ -541,9 +549,28 @@ def train_eval(cfg: Dict[str, Any]):
 
     # Data
     ds_tok, collator, id2label = load_and_tokenize(cfg, save_root, cfg["max_train"], cfg["max_val"])
-    train_dl = DataLoader(ds_tok["train"], batch_size=cfg["batch_size"], shuffle=True, collate_fn=collator, pin_memory=True)
+    train_dl = DataLoader(
+        ds_tok["train"],
+        batch_size=cfg["batch_size"],
+        shuffle=True,
+        collate_fn=collator,
+        pin_memory=True,
+        num_workers=2,
+        persistent_workers=True,
+        prefetch_factor=2,
+    )
     val_bs = max(1, cfg["batch_size"] * 2)
-    val_dl = DataLoader(ds_tok["validation"], batch_size=val_bs, shuffle=False, collate_fn=collator, pin_memory=True)
+    val_dl = DataLoader(
+        ds_tok["validation"],
+        batch_size=val_bs,
+        shuffle=False,
+        collate_fn=collator,
+        pin_memory=True,
+        num_workers=2,
+        persistent_workers=True,
+        prefetch_factor=2,
+    )
+
 
     # Early paths
     if cfg["eval_only"] and not best_dir.exists():
@@ -641,7 +668,9 @@ def train_eval(cfg: Dict[str, Any]):
     warmup_steps = int(total_steps * cfg["warmup_ratio"])
     opt = bnb.optim.PagedAdamW8bit(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"], betas=(0.9,0.95), eps=1e-8)
     sch = get_linear_schedule_with_warmup(opt, warmup_steps, total_steps)
-    scaler = torch.cuda.amp.GradScaler(enabled=(cfg["precision"] == "fp16"))
+    from torch.amp import GradScaler
+    scaler = GradScaler('cuda', enabled=(cfg["precision"] == "fp16"))
+
 
     # W&B
     if cfg["wandb"]:
@@ -661,7 +690,8 @@ def train_eval(cfg: Dict[str, Any]):
             attention_mask = batch.get("attention_mask")
             if attention_mask is not None: attention_mask = attention_mask.to(device, non_blocking=True)
             labels = batch["labels"].to(device, non_blocking=True)
-            with torch.autocast(device_type="cuda", dtype=(torch.bfloat16 if cfg["precision"] == "bf16" else torch.float16)):
+            from torch.amp import autocast
+            with autocast('cuda', dtype=(torch.bfloat16 if cfg["precision"] == "bf16" else torch.float16)):
                 out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
                 loss = out["loss"]
                 logits = out["logits"].float()

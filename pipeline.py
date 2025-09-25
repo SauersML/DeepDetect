@@ -366,16 +366,21 @@ def safe_load_tokenizer(model_id: str):
             shutil.copy2(src, local_tok_dir / fname)
             present.append(fname)
 
-    # Require at least one real tokenizer *set*
+    # Require at least one real tokenizer *set*; otherwise fall back to HF auto-load
     has_sp = ("tokenizer.json" in present) or ("tokenizer.model" in present)
     has_gpt2_bpe = ("vocab.json" in present) and ("merges.txt" in present)
     if not (has_sp or has_gpt2_bpe):
-        raise RuntimeError(
-            f"No tokenizer files found for {model_id}. "
-            f"Expected one of: (tokenizer.json) or (tokenizer.model) or (vocab.json + merges.txt). "
-            f"Found: {present}"
+        _log("no tokenizer files in snapshot; falling back to AutoTokenizer.from_pretrained(model_id)")
+        tok = AutoTokenizer.from_pretrained(
+            model_id,
+            use_fast=True,
+            trust_remote_code=False,
         )
-
+        if tok.pad_token is None and getattr(tok, "eos_token", None):
+            tok.pad_token = tok.eos_token
+            _log(f"set pad_token = eos_token ({tok.eos_token})")
+        _log("tokenizer ready (fallback path)")
+        return tok
 
     # 4) Sanitize tokenizer_config.json deterministically
     cfg_path = local_tok_dir / "tokenizer_config.json"

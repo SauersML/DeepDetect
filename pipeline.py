@@ -133,6 +133,8 @@ def ensure_core_packages():
         "tiktoken":       "0.7.0",
         "tqdm":           "4.66.0",
         "wandb":          "0.17.0",
+        "pandas":         "2.2.2",
+        "pyarrow":        "14.0.2",
     }
     to_install = [f"{k}>={v}" for k, v in reqs.items() if needs(k, v)]
     if to_install:

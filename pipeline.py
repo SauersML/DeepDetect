@@ -582,6 +582,7 @@ def train_eval(cfg: Dict[str, Any]):
     base.config.use_cache = False
     if hasattr(base, "gradient_checkpointing_enable"):
         base.gradient_checkpointing_enable()
+    base = prepare_model_for_kbit_training(base)
     hidden_size = getattr(base.config, "hidden_size", None) or getattr(base.config, "hidden_dim", None)
     assert hidden_size, "Could not infer hidden size."
     log(f"Model loaded in {time.time()-t0:.1f}s | hidden_size={hidden_size}", prefix="[MODEL]")

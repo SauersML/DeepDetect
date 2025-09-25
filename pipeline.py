@@ -8,6 +8,24 @@ from typing import Any, Dict
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import contextlib
+from pathlib import Path
+
+try:
+    from transformers.models.auto import auto_factory as _hf_af
+    _orig_af_from_pretrained = _hf_af.from_pretrained
+
+    def _safe_from_pretrained(pretrained_model_name_or_path=None, *args, **kwargs):
+        # If `peft` leaked in and isn't a real path/string/None, nuke it.
+        if "peft" in kwargs:
+            v = kwargs["peft"]
+            if not (v is None or isinstance(v, (str, os.PathLike))):
+                kwargs["peft"] = None
+        return _orig_af_from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+
+    _hf_af.from_pretrained = _safe_from_pretrained
+except Exception:
+    # If the internal layout changes, silently do nothing.
+    pass
 
 @contextlib.contextmanager
 def _disable_peft_autoload():

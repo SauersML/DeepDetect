@@ -4,9 +4,49 @@
 import os, sys, time, json, math, re, gc, argparse, importlib, pkgutil, subprocess
 from pathlib import Path
 from typing import Any, Dict
-from transformers import AutoConfig, AutoModelForCausalLM
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+import contextlib
+
+@contextlib.contextmanager
+def _disable_peft_autoload():
+    """
+    Make transformers think PEFT is unavailable *just while* we load the base model.
+    Avoids the 'maybe_adapter_path' type-confusion bug.
+    """
+    import transformers
+    # 1) patch the central utils gate
+    from transformers import utils as hf_utils
+    _saved_utils = getattr(hf_utils, "is_peft_available", None)
+    hf_utils.is_peft_available = lambda: False
+
+    # 2) also patch modules that cached the symbol at import time
+    #    (auto_factory / modeling_utils may have their own copy)
+    _saved_auto = _saved_modeling = None
+    try:
+        from transformers.models.auto import auto_factory as af
+        _saved_auto = getattr(af, "is_peft_available", None)
+        af.is_peft_available = lambda: False
+    except Exception:
+        pass
+    try:
+        from transformers import modeling_utils as mu
+        _saved_modeling = getattr(mu, "is_peft_available", None)
+        mu.is_peft_available = lambda: False
+    except Exception:
+        pass
+
+    try:
+        yield
+    finally:
+        # restore originals
+        if _saved_utils is not None:
+            hf_utils.is_peft_available = _saved_utils
+        if _saved_auto is not None:
+            af.is_peft_available = _saved_auto
+        if _saved_modeling is not None:
+            mu.is_peft_available = _saved_modeling
 
 
 # ---------------------------
@@ -373,30 +413,32 @@ def safe_load_tokenizer(model_id: str):
 # ---------------------------
 # [H0] Backbone loader using AutoModelForCausalLM
 # ---------------------------
+from transformers import AutoConfig, AutoModelForCausalLM
+
 def safe_load_backbone(model_id: str, base_dtype, quant, *, device_map=None, trust_remote_code: bool = False):
     if device_map is None:
         device_map = {"": 0}
 
     cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=trust_remote_code)
-
     if hasattr(cfg, "auto_map"):
         cfg.auto_map = None
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        config=cfg,
-        quantization_config=quant,                 # BitsAndBytesConfig or None
-        torch_dtype=(None if quant else base_dtype),
-        device_map=device_map,
-        trust_remote_code=trust_remote_code,
-    )
+    # >>> disable PEFT autoload only for this call <<<
+    with _disable_peft_autoload():
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            config=cfg,
+            quantization_config=quant,
+            torch_dtype=(None if quant else base_dtype),
+            device_map=device_map,
+            trust_remote_code=trust_remote_code,
+        )
 
-    # Match training loop expectations
+    # training-time prefs
     model.config.output_hidden_states = True
     model.config.use_cache = False
     if hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable()
-
     return model
 
 def load_and_tokenize(cfg: Dict[str, Any], save_root: Path, max_train=0, max_val=0):

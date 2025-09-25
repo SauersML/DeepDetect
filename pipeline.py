@@ -11,7 +11,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 # injected into ``cfg`` inside ``main`` so that the script can run without
 # requiring external argument parsing or environment mutation.
 DEFAULT_CFG = {
-    "model_id": "sshleifer/tiny-gpt2",
+    "model_id": "google/gemma-3-1b-pt",
     "dataset_id": "imdb",
     "save_dir": "./runs",
     "seed": 42,

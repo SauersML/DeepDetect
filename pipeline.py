@@ -509,34 +509,6 @@ def load_and_tokenize(cfg: Dict[str, Any], save_root: Path, max_train=0, max_val
     return ds_tok, collator, id2label
 
 # ---------------------------
-# [H0] Backbone loader with auto_map patch (no fallbacks)
-# ---------------------------
-def safe_load_backbone(model_id: str, base_dtype, quant):
-    from transformers import AutoConfig, AutoModelForCausalLM
-
-    # Load config first (this never tries to open modeling files)
-    cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=False)
-
-    # Some repos ship a dict-valued auto_map. Transformers later treats values as file paths.
-    am = getattr(cfg, "auto_map", None)
-    if isinstance(am, dict):
-        # Keep only string values; drop anything that's a dict/object
-        fixed = {k: v for k, v in am.items() if isinstance(v, str)}
-        if fixed != am:
-            setattr(cfg, "auto_map", fixed if fixed else None)
-            log("patched config.auto_map (removed non-string entries)", prefix="[MODEL]")
-
-    # Load using the patched config; quant is respected if provided
-    return AutoModelForCausalLM.from_pretrained(
-        model_id,
-        config=cfg,
-        quantization_config=quant,
-        dtype=None if quant else base_dtype,
-        device_map={"": 0},
-        trust_remote_code=False,  # deterministic; relies on builtin class
-    )
-
-# ---------------------------
 # [H] TRAIN / EVAL
 # ---------------------------
 def train_eval(cfg: Dict[str, Any]):

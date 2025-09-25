@@ -457,6 +457,34 @@ def load_and_tokenize(cfg: Dict[str, Any], save_root: Path, max_train=0, max_val
     return ds_tok, collator, id2label
 
 # ---------------------------
+# [H0] Backbone loader with auto_map patch (no fallbacks)
+# ---------------------------
+def safe_load_backbone(model_id: str, base_dtype, quant):
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    # Load config first (this never tries to open modeling files)
+    cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=False)
+
+    # Some repos ship a dict-valued auto_map. Transformers later treats values as file paths.
+    am = getattr(cfg, "auto_map", None)
+    if isinstance(am, dict):
+        # Keep only string values; drop anything that's a dict/object
+        fixed = {k: v for k, v in am.items() if isinstance(v, str)}
+        if fixed != am:
+            setattr(cfg, "auto_map", fixed if fixed else None)
+            log("patched config.auto_map (removed non-string entries)", prefix="[MODEL]")
+
+    # Load using the patched config; quant is respected if provided
+    return AutoModelForCausalLM.from_pretrained(
+        model_id,
+        config=cfg,
+        quantization_config=quant,
+        dtype=None if quant else base_dtype,
+        device_map={"": 0},
+        trust_remote_code=False,  # deterministic; relies on builtin class
+    )
+
+# ---------------------------
 # [H] TRAIN / EVAL
 # ---------------------------
 def train_eval(cfg: Dict[str, Any]):
@@ -524,14 +552,7 @@ def train_eval(cfg: Dict[str, Any]):
     # Model load (progress printed by HF/transformers)
     t0 = time.time()
     log(f"Loading base model: {cfg['model_id']}", prefix="[MODEL]")
-    try:
-        base = AutoModelForCausalLM.from_pretrained(
-            cfg["model_id"], quantization_config=quant, dtype=None if quant else base_dtype, device_map={"":0}
-        )
-    except Exception as e:
-        log(f"First attempt failed ({e}) → retry no-quant", prefix="[MODEL]")
-        base = AutoModelForCausalLM.from_pretrained(cfg["model_id"], dtype=base_dtype, device_map={"":0})
-
+    base = safe_load_backbone(cfg["model_id"], base_dtype, quant)
     
     base.config.output_hidden_states = True
     base.config.use_cache = False
@@ -730,7 +751,7 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
         quant = None
 
     log("Reloading best checkpoint …", prefix="[EVAL]")
-    base = AutoModelForCausalLM.from_pretrained(cfg["model_id"], quantization_config=quant, dtype=None if quant else base_dtype, device_map={"":0})
+    base = safe_load_backbone(cfg["model_id"], base_dtype, quant)
     base.config.output_hidden_states = True; base.config.use_cache = False
     peft = PeftModel.from_pretrained(base, best_dir / "lora_adapter")
 

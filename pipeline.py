@@ -284,67 +284,34 @@ def json_dump(obj, path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f: json.dump(obj, f, indent=2)
 
-def safe_load_tokenizer(model_id: str):
-    import os, json, re, shutil
-    from pathlib import Path
-    from huggingface_hub import snapshot_download
-    from transformers import AutoTokenizer
+# ---------------------------
+# [H0] Backbone loader that bypasses auto_factory
+# ---------------------------
+def safe_load_backbone(model_id: str, base_dtype, quant):
+    from transformers import AutoConfig
+    from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING
 
-    def _log(msg): log(f"[TOK] {msg}")
+    # 1) Load config (no remote code)
+    cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=False)
 
-    # Where to keep our patched copy
-    tmp_root = Path(os.environ.get("TMPDIR", "/tmp")) / (os.environ.get("USER", "user") or "user")
-    local_tok_dir = tmp_root / f"tokpatch__{re.sub(r'[^a-zA-Z0-9_.-]+','_',model_id)}"
-    local_tok_dir.mkdir(parents=True, exist_ok=True)
+    # 2) Nuke auto_map entirely so no dynamic/adapter probing is attempted downstream
+    if hasattr(cfg, "auto_map"):
+        setattr(cfg, "auto_map", None)
 
-    # Pull only tokenizer files (this uses/creates HF Hub cache; re-runs are instant)
-    allow = ["tokenizer.json", "tokenizer.model", "special_tokens_map.json",
-             "added_tokens.json", "tokenizer_config.json"]
-    _log(f"snapshot_download allow_patterns={allow}")
-    snap_dir = snapshot_download(
-        repo_id=model_id,
-        allow_patterns=allow,
-        cache_dir=os.environ.get("HF_HUB_CACHE")  # respects your configured cache
-    )
-
-    # Copy tokenizer files into a writable spot we can patch
-    for fname in allow:
-        src = Path(snap_dir) / fname
-        if src.exists():
-            shutil.copy2(src, local_tok_dir / fname)
-
-    # Patch tokenizer_config.json if needed
-    cfg_path = local_tok_dir / "tokenizer_config.json"
-    if cfg_path.exists():
-        with open(cfg_path, "r", encoding="utf-8") as f:
-            tok_cfg = json.load(f)
-        ct = tok_cfg.get("chat_template", None)
-        if isinstance(ct, dict):
-            # Prefer the raw template string if present, else drop it
-            if isinstance(ct.get("template"), str):
-                tok_cfg["chat_template"] = ct["template"]
-                _log("patched chat_template: dict → string")
-            else:
-                tok_cfg.pop("chat_template", None)
-                _log("removed invalid chat_template (dict without 'template')")
-        with open(cfg_path, "w", encoding="utf-8") as f:
-            json.dump(tok_cfg, f, ensure_ascii=False)
-    else:
-        _log("no tokenizer_config.json present (nothing to patch)")
-
-    # Load tokenizer from the patched local dir
+    # 3) Resolve the concrete class from the built-in mapping and load weights directly
     try:
-        tok = AutoTokenizer.from_pretrained(str(local_tok_dir), use_fast=True, trust_remote_code=True)
-    except Exception as e:
-        _log(f"fast load failed ({e}) → retrying use_fast=False")
-        tok = AutoTokenizer.from_pretrained(str(local_tok_dir), use_fast=False, trust_remote_code=True)
+        model_cls = MODEL_FOR_CAUSAL_LM_MAPPING[type(cfg)]
+    except KeyError as e:
+        raise RuntimeError(f"No built-in CausalLM class for config {type(cfg).__name__}. "
+                           f"Upgrade transformers or use a built-in model id.") from e
 
-    if tok.pad_token is None and hasattr(tok, "eos_token") and tok.eos_token:
-        tok.pad_token = tok.eos_token
-        _log(f"set pad_token = eos_token ({tok.eos_token})")
-
-    _log("tokenizer ready")
-    return tok
+    return model_cls.from_pretrained(
+        model_id,
+        config=cfg,
+        quantization_config=quant,
+        dtype=None if quant else base_dtype,
+        device_map={"": 0},
+    )
 
 def load_and_tokenize(cfg: Dict[str, Any], save_root: Path, max_train=0, max_val=0):
     disable_hf_transfer()
@@ -492,7 +459,7 @@ def train_eval(cfg: Dict[str, Any]):
     import torch.nn as nn, torch.nn.functional as F
     from torch.utils.data import DataLoader
     from tqdm.auto import tqdm
-    from transformers import AutoModelForCausalLM, get_linear_schedule_with_warmup
+    from transformers import get_linear_schedule_with_warmup
     try:
         from transformers import BitsAndBytesConfig
     except Exception:
@@ -571,16 +538,8 @@ def train_eval(cfg: Dict[str, Any]):
             r=cfg["lora_r"], lora_alpha=cfg["lora_alpha"], lora_dropout=cfg["lora_dropout"],
             target_modules=cfg["target_mods"].split(","), bias="none", task_type="CAUSAL_LM",
         )
-        try:
-            backbone = get_peft_model(base, lcfg)
-            backbone.print_trainable_parameters()
-        except AttributeError as e:
-            log(f"LoRA injection fallback: {e} → reload base full-precision", prefix="[LoRA]")
-            base = AutoModelForCausalLM.from_pretrained(cfg["model_id"], dtype=base_dtype, device_map={"":0})
-            base.config.output_hidden_states = True; base.config.use_cache = False
-            if hasattr(base, "gradient_checkpointing_enable"): base.gradient_checkpointing_enable()
-            backbone = get_peft_model(base, lcfg)
-            backbone.print_trainable_parameters()
+        backbone = get_peft_model(base, lcfg)
+        backbone.print_trainable_parameters()
 
     # Lightweight classifier on pooled last hidden state
     class SeqClassifier(nn.Module):
@@ -592,7 +551,8 @@ def train_eval(cfg: Dict[str, Any]):
             self.num_labels = num_labels
         def forward(self, input_ids=None, attention_mask=None, labels=None):
             out = self.backbone(input_ids=input_ids, attention_mask=attention_mask,
-                                output_hidden_states=True, use_cache=False, return_dict=True)
+                                output_hidden_states=True, return_dict=True)
+
             h = out.hidden_states[-1]
             if attention_mask is None:
                 pooled = h[:, -1]
@@ -731,7 +691,6 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
     import torch, numpy as np
     from torch.utils.data import DataLoader
     from tqdm.auto import tqdm
-    from transformers import AutoModelForCausalLM
     try:
         from transformers import BitsAndBytesConfig
     except Exception:
@@ -763,7 +722,7 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
         def __init__(self, backbone, hidden, num_labels=2):
             super().__init__(); self.backbone = backbone; self.cls = nn.Linear(hidden, num_labels)
         def forward(self, input_ids=None, attention_mask=None):
-            out = self.backbone(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True, use_cache=False, return_dict=True)
+            out = self.backbone(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True, return_dict=True)
             h = out.hidden_states[-1]; mask = attention_mask.unsqueeze(-1).type_as(h) if attention_mask is not None else None
             pooled = (h * mask).sum(1) / mask.sum(1).clamp(min=1.0) if mask is not None else h[:, -1]
             return self.cls(pooled)

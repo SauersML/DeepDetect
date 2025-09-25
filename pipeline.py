@@ -429,21 +429,29 @@ def train_eval(cfg: Dict[str, Any]):
     _t.set_float32_matmul_precision("medium")
     log(f"Precision: {cfg['precision']}", prefix="[TRAIN]")
 
-    # Quantization choice
+    # Quantization choice (no regex, no try/except)
+    from packaging.version import Version
+    
     base_dtype = _t.bfloat16 if cfg["precision"] == "bf16" else _t.float16
-    bnb_ok = False
-    try:
-        ver = tuple(int(x) for x in re.findall(r"\d+", bnb.__version__)[:3])
-        bnb_ok = ver >= (0, 42, 0)
-    except Exception:
-        pass
-    quant = None
+    
+    # Normalize version like "0.43.1+cu124" or "0.43.1-foo" → "0.43.1"
+    bnb_version_raw = getattr(bnb, "__version__", "0.0.0")
+    bnb_version_clean = bnb_version_raw.split("+", 1)[0].split("-", 1)[0]
+    
+    bnb_ok = Version(bnb_version_clean) >= Version("0.42.0")
+    
     if bnb_ok:
-        quant = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
-                                   bnb_4bit_compute_dtype=base_dtype, bnb_4bit_use_double_quant=True)
-        log("Quantization: 4-bit NF4", prefix="[MODEL]")
+        quant = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=base_dtype,
+            bnb_4bit_use_double_quant=True,
+        )
+        log(f"Quantization: 4-bit NF4 (bitsandbytes {bnb_version_raw})", prefix="[MODEL]")
     else:
-        log("Quantization: disabled (bitsandbytes not OK)", prefix="[MODEL]")
+        quant = None
+        log(f"Quantization: disabled (bitsandbytes {bnb_version_raw} < 0.42.0)", prefix="[MODEL]")
+
 
     # Model load (progress printed by HF/transformers)
     t0 = time.time()
@@ -455,6 +463,8 @@ def train_eval(cfg: Dict[str, Any]):
     except Exception as e:
         log(f"First attempt failed ({e}) → retry no-quant", prefix="[MODEL]")
         base = AutoModelForCausalLM.from_pretrained(cfg["model_id"], dtype=base_dtype, device_map={"":0})
+
+    
     base.config.output_hidden_states = True
     base.config.use_cache = False
     if hasattr(base, "gradient_checkpointing_enable"):

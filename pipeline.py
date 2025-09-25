@@ -486,13 +486,19 @@ def load_and_tokenize(cfg: Dict[str, Any], save_root: Path, max_train=0, max_val
         return int(v)
 
     # subsample
-    def maybe_take(ds_split, nmax):
-        if nmax and len(ds_split) > nmax:
-            return ds_split.shuffle(seed=cfg["seed"]).select(range(nmax))
+    auto_max_train = int(os.environ.get("AUTO_MAX_TRAIN", "20000"))
+    auto_max_val   = int(os.environ.get("AUTO_MAX_VAL",   "2000"))
+    disable_auto   = os.environ.get("AUTO_SUBSAMPLE", "1") in {"0", "false", "False"}
+    
+    def maybe_take(ds_split, nmax, fallback):
+        limit = nmax if (nmax and nmax > 0) else (0 if disable_auto else fallback)
+        if limit and len(ds_split) > limit:
+            log(f"Auto-subsample → {limit} rows (set AUTO_SUBSAMPLE=0 to disable)", prefix="[DATA]")
+            return ds_split.shuffle(seed=cfg["seed"]).select(range(limit))
         return ds_split
-
-    ds["train"] = maybe_take(ds["train"], max_train)
-    ds["validation"] = maybe_take(ds["validation"], max_val)
+    
+    ds["train"] = maybe_take(ds["train"], max_train, auto_max_train)
+    ds["validation"] = maybe_take(ds["validation"], max_val, auto_max_val)
     log(f"Using: train={len(ds['train'])}, val={len(ds['validation'])}", prefix="[DATA]")
 
     tok = safe_load_tokenizer(cfg["model_id"])
@@ -840,7 +846,8 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
         attention_mask = batch.get("attention_mask")
         if attention_mask is not None: attention_mask = attention_mask.to(device, non_blocking=True)
         labels = batch["labels"].to(device, non_blocking=True)
-        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=base_dtype):
+        from torch.amp import autocast
+        with torch.no_grad(), autocast('cuda', dtype=base_dtype):
             logits = model(input_ids=input_ids, attention_mask=attention_mask).float()
         prob_ai = torch.softmax(logits, dim=-1)[:, 1]
         pred = logits.argmax(-1)

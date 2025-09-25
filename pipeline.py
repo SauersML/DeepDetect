@@ -625,6 +625,7 @@ def train_eval(cfg: Dict[str, Any]):
     base.config.use_cache = False
     if hasattr(base, "gradient_checkpointing_enable"):
         base.gradient_checkpointing_enable()
+    from peft import prepare_model_for_kbit_training
     base = prepare_model_for_kbit_training(base)
     hidden_size = getattr(base.config, "hidden_size", None) or getattr(base.config, "hidden_dim", None)
     assert hidden_size, "Could not infer hidden size."

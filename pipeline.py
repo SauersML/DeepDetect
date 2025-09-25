@@ -124,7 +124,7 @@ def ensure_core_packages():
         "transformers":   "4.56.2",
         "datasets":       "2.20.0",
         "accelerate":     "0.33.0",
-        "peft":           "0.12.0",
+        "peft":           "0.17.1",
         "bitsandbytes":   "0.43.1",
         "evaluate":       "0.4.2",
         "scikit-learn":   "1.4.0",

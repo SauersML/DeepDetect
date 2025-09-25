@@ -394,12 +394,11 @@ def safe_load_backbone(model_id: str, base_dtype, quant):
     return model_cls.from_pretrained(
         model_id,
         config=cfg,
-        quantization_config=quant,
-        dtype=None if quant else base_dtype,
+        quantization_config=quant,                 # OK
+        torch_dtype=None if quant else base_dtype, # <-- use torch_dtype (not dtype)
         device_map={"": 0},
-        # Private API: prevents bad os.path.isfile() call
-        _adapter_model_path=None,
     )
+
 
 def load_and_tokenize(cfg: Dict[str, Any], save_root: Path, max_train=0, max_val=0):
     disable_hf_transfer()

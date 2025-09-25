@@ -403,7 +403,11 @@ def train_eval(cfg: Dict[str, Any]):
     import torch.nn as nn, torch.nn.functional as F
     from torch.utils.data import DataLoader
     from tqdm.auto import tqdm
-    from transformers import AutoModelForCausalLM, BitsAndBytesConfig, get_linear_schedule_with_warmup
+    from transformers import AutoModelForCausalLM, get_linear_schedule_with_warmup
+    try:
+        from transformers import BitsAndBytesConfig
+    except Exception:
+        from transformers.utils.quantization_config import BitsAndBytesConfig
     from peft import LoraConfig, get_peft_model, PeftModel
     import bitsandbytes as bnb
 
@@ -635,7 +639,11 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
     import torch, numpy as np
     from torch.utils.data import DataLoader
     from tqdm.auto import tqdm
-    from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+    from transformers import AutoModelForCausalLM
+    try:
+        from transformers import BitsAndBytesConfig
+    except Exception:
+        from transformers.utils.quantization_config import BitsAndBytesConfig
     from peft import PeftModel
     from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 

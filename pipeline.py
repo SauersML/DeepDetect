@@ -1,3 +1,6 @@
+# pip install --upgrade huggingface_hub
+# hf auth login
+
 import os, sys, time, json, math, re, gc, argparse, importlib, pkgutil, subprocess
 from pathlib import Path
 from typing import Any, Dict

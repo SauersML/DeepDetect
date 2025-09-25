@@ -255,38 +255,6 @@ def disable_hf_transfer():
         log("Fast transfer disabled via env.", prefix="[HF]")
 
 # ---------------------------
-# [D] CLI / CONFIG
-# ---------------------------
-def build_argparser():
-    p = argparse.ArgumentParser(description="Gemma-3 1B PT • AI-text detection with (Q)LoRA")
-    p.add_argument("--model-id", default="google/gemma-3-1b-pt")
-    p.add_argument("--dataset-id", default="yaful/MAGE")
-    p.add_argument("--save-dir", default="./outputs/gemma3-1b-pt-mage")
-    p.add_argument("--seed", type=int, default=5541)
-    p.add_argument("--precision", choices=["bf16","fp16"], default=None, help="auto-detect if None")
-    p.add_argument("--max-length", type=int, default=1024)
-    p.add_argument("--epochs", type=int, default=3)
-    p.add_argument("--batch-size", type=int, default=4)
-    p.add_argument("--grad-accum", type=int, default=8)
-    p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--weight-decay", type=float, default=0.01)
-    p.add_argument("--warmup-ratio", type=float, default=0.06)
-    p.add_argument("--max-grad-norm", type=float, default=1.0)
-    p.add_argument("--use-lora", action="store_true", default=True)
-    p.add_argument("--no-lora", dest="use_lora", action="store_false")
-    p.add_argument("--target-mods", default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj")
-    p.add_argument("--lora-r", type=int, default=16)
-    p.add_argument("--lora-alpha", type=int, default=32)
-    p.add_argument("--lora-dropout", type=float, default=0.1)
-    p.add_argument("--max-train", type=int, default=0, help="0 = use full train")
-    p.add_argument("--max-val", type=int, default=0, help="0 = use full val")
-    p.add_argument("--login", action="store_true", help="login using $HUGGINGFACE_TOKEN or $HF_TOKEN")
-    p.add_argument("--resume", action="store_true", help="skip training if best checkpoint exists")
-    p.add_argument("--wandb", action="store_true", help="enable Weights & Biases logging")
-    p.add_argument("--eval-only", action="store_true", help="eval best checkpoint only")
-    return p
-
-# ---------------------------
 # [E] GPU PROBE
 # ---------------------------
 def gpu_probe(preferred=None):
@@ -881,8 +849,6 @@ def maybe_login(do_login: bool):
 # [K] MAIN
 # ---------------------------
 def main():
-    args = build_argparser().parse_args()
-
     # 1) Very first: bootstrap deps, env, caches
     ensure_core_packages()
     setup_env_and_caches()

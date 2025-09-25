@@ -892,41 +892,37 @@ def main():
     disable_hf_transfer()
 
     # 2) GPU probe + precision
-    prec = gpu_probe()
-    precision = args.precision or prec
+    precision = gpu_probe()
 
     # 3) Config
     cfg = {
         "project": "deepfake-detect-gemma3",
-        "model_id": args.model_id,
-        "dataset_id": args.dataset_id,
-        "save_dir": args.save_dir,
-        "seed": args.seed,
+        "model_id": model_id,
+        "dataset_id": dataset_id,
+        "save_dir": save_dir,
+        "seed": seed,
         "precision": precision,
-        "max_length": args.max_length,
-        "epochs": args.epochs,
-        "batch_size": args.batch_size,
-        "grad_accum": args.grad_accum,
-        "lr": args.lr,
-        "weight_decay": args.weight_decay,
-        "warmup_ratio": args.warmup_ratio,
-        "max_grad_norm": args.max_grad_norm,
-        "use_lora": args.use_lora,
-        "target_mods": args.target_mods,
-        "lora_r": args.lora_r,
-        "lora_alpha": args.lora_alpha,
-        "lora_dropout": args.lora_dropout,
-        "max_train": args.max_train,
-        "max_val": args.max_val,
-        "wandb": args.wandb,
-        "eval_only": args.eval_only,
-        "resume": args.resume,
+        "max_length": max_length,
+        "epochs": epochs,
+        "batch_size": batch_size,
+        "grad_accum": grad_accum,
+        "lr": lr,
+        "weight_decay": weight_decay,
+        "warmup_ratio": warmup_ratio,
+        "max_grad_norm": max_grad_norm,
+        "use_lora": use_lora,
+        "target_mods": target_mods,
+        "lora_r": lora_r,
+        "lora_alpha": lora_alpha,
+        "lora_dropout": lora_dropout,
+        "max_train": max_train,
+        "max_val": max_val,
+        "wandb": wandb,
+        "eval_only": eval_only,
+        "resume": resume,
     }
     hline("[CFG]")
     log(json.dumps(cfg, indent=2))
-
-    # 4) HF login (optional)
-    maybe_login(args.login)
 
     # 5) Seed
     set_seed(cfg["seed"])

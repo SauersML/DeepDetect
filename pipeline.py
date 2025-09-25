@@ -5,6 +5,7 @@ import os, sys, time, json, math, re, gc, argparse, importlib, pkgutil, subproce
 from pathlib import Path
 from typing import Any, Dict
 from peft import prepare_model_for_kbit_training
+from transformers import AutoConfig, AutoModelForCausalLM
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
@@ -369,38 +370,35 @@ def safe_load_tokenizer(model_id: str):
 
     _log("tokenizer ready")
     return tok
+
 # ---------------------------
 # [H0] Backbone loader using AutoModelForCausalLM
 # ---------------------------
 def safe_load_backbone(model_id: str, base_dtype, quant, *, device_map=None, trust_remote_code: bool = False):
-    from transformers import AutoConfig, AutoModelForCausalLM
-
     if device_map is None:
         device_map = {"": 0}
 
-    # Load config (no remote code by default)
     cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=trust_remote_code)
 
-    # Prevent dynamic auto_map probing so adapters/remote maps aren't triggered implicitly
     if hasattr(cfg, "auto_map"):
-        setattr(cfg, "auto_map", None)
+        cfg.auto_map = None
 
-    # Load the model
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         config=cfg,
-        quantization_config=quant,
-        torch_dtype=None if quant else base_dtype,  # IMPORTANT: use torch_dtype, not dtype
+        quantization_config=quant,                 # BitsAndBytesConfig or None
+        torch_dtype=(None if quant else base_dtype),
         device_map=device_map,
         trust_remote_code=trust_remote_code,
     )
 
+    # Match training loop expectations
     model.config.output_hidden_states = True
     model.config.use_cache = False
+    if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
 
     return model
-
-
 
 def load_and_tokenize(cfg: Dict[str, Any], save_root: Path, max_train=0, max_val=0):
     disable_hf_transfer()

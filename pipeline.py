@@ -284,35 +284,6 @@ def json_dump(obj, path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f: json.dump(obj, f, indent=2)
 
-# ---------------------------
-# [H0] Backbone loader that bypasses auto_factory
-# ---------------------------
-def safe_load_backbone(model_id: str, base_dtype, quant):
-    from transformers import AutoConfig
-    from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING
-
-    # 1) Load config (no remote code)
-    cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=False)
-
-    # 2) Nuke auto_map entirely so no dynamic/adapter probing is attempted downstream
-    if hasattr(cfg, "auto_map"):
-        setattr(cfg, "auto_map", None)
-
-    # 3) Resolve the concrete class from the built-in mapping and load weights directly
-    try:
-        model_cls = MODEL_FOR_CAUSAL_LM_MAPPING[type(cfg)]
-    except KeyError as e:
-        raise RuntimeError(f"No built-in CausalLM class for config {type(cfg).__name__}. "
-                           f"Upgrade transformers or use a built-in model id.") from e
-
-    return model_cls.from_pretrained(
-        model_id,
-        config=cfg,
-        quantization_config=quant,
-        dtype=None if quant else base_dtype,
-        device_map={"": 0},
-    )
-
 def safe_load_tokenizer(model_id: str):
     import os, json, re, shutil
     from pathlib import Path
@@ -397,6 +368,35 @@ def safe_load_tokenizer(model_id: str):
 
     _log("tokenizer ready")
     return tok
+
+# ---------------------------
+# [H0] Backbone loader that bypasses auto_factory
+# ---------------------------
+def safe_load_backbone(model_id: str, base_dtype, quant):
+    from transformers import AutoConfig
+    from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING
+
+    # 1) Load config (no remote code)
+    cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=False)
+
+    # 2) Nuke auto_map entirely so no dynamic/adapter probing is attempted downstream
+    if hasattr(cfg, "auto_map"):
+        setattr(cfg, "auto_map", None)
+
+    # 3) Resolve the concrete class from the built-in mapping and load weights directly
+    try:
+        model_cls = MODEL_FOR_CAUSAL_LM_MAPPING[type(cfg)]
+    except KeyError as e:
+        raise RuntimeError(f"No built-in CausalLM class for config {type(cfg).__name__}. "
+                           f"Upgrade transformers or use a built-in model id.") from e
+
+    return model_cls.from_pretrained(
+        model_id,
+        config=cfg,
+        quantization_config=quant,
+        dtype=None if quant else base_dtype,
+        device_map={"": 0},
+    )
 
 def load_and_tokenize(cfg: Dict[str, Any], save_root: Path, max_train=0, max_val=0):
     disable_hf_transfer()

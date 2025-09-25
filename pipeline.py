@@ -313,6 +313,91 @@ def safe_load_backbone(model_id: str, base_dtype, quant):
         device_map={"": 0},
     )
 
+def safe_load_tokenizer(model_id: str):
+    import os, json, re, shutil
+    from pathlib import Path
+    from huggingface_hub import snapshot_download
+    from transformers import AutoTokenizer
+
+    def _log(msg): log(f"[TOK] {msg}")
+
+    # 1) Local patch dir (separate from HF cache)
+    tmp_root = Path(os.environ.get("TMPDIR", "/tmp")) / (os.environ.get("USER", "user") or "user")
+    local_tok_dir = tmp_root / f"tokpatch__{re.sub(r'[^a-zA-Z0-9_.-]+', '_', model_id)}"
+    local_tok_dir.mkdir(parents=True, exist_ok=True)
+
+    # 2) Pull only tokenizer artifacts into cache; re-runs hit the cache (fast)
+    allow = [
+        "tokenizer.json",
+        "tokenizer.model",
+        "special_tokens_map.json",
+        "added_tokens.json",
+        "tokenizer_config.json",
+    ]
+    _log(f"snapshot_download allow_patterns={allow}")
+    snap_dir = snapshot_download(
+        repo_id=model_id,
+        allow_patterns=allow,
+        cache_dir=os.environ.get("HF_HUB_CACHE")  # if set by your env bootstrap
+    )
+
+    # 3) Copy files to our writable patch location
+    present = []
+    for fname in allow:
+        src = Path(snap_dir) / fname
+        if src.exists():
+            shutil.copy2(src, local_tok_dir / fname)
+            present.append(fname)
+
+    # Require at least one real tokenizer file
+    if not any(f in present for f in ("tokenizer.json", "tokenizer.model")):
+        raise RuntimeError(
+            f"No tokenizer files found for {model_id}. "
+            f"Looked for: tokenizer.json or tokenizer.model (found: {present})"
+        )
+
+    # 4) Sanitize tokenizer_config.json deterministically
+    cfg_path = local_tok_dir / "tokenizer_config.json"
+    if cfg_path.exists():
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            tok_cfg = json.load(f)
+
+        # Normalize/strip broken chat template fields
+        if "chat_template" in tok_cfg:
+            ct = tok_cfg["chat_template"]
+            if isinstance(ct, dict) and isinstance(ct.get("template"), str):
+                tok_cfg["chat_template"] = ct["template"]
+                _log("patched chat_template: dict → string")
+            else:
+                tok_cfg.pop("chat_template", None)
+                _log("removed invalid chat_template")
+
+        if "chat_template_file" in tok_cfg and not isinstance(tok_cfg["chat_template_file"], str):
+            tok_cfg.pop("chat_template_file", None)
+            _log("removed invalid chat_template_file")
+
+        # Persist sanitized config
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump(tok_cfg, f, ensure_ascii=False)
+
+    else:
+        _log("no tokenizer_config.json present (nothing to patch)")
+
+    # 5) Load tokenizer
+    tok = AutoTokenizer.from_pretrained(
+        str(local_tok_dir),
+        use_fast=True,
+        trust_remote_code=False,
+    )
+
+    # 6) Ensure padding token exists
+    if tok.pad_token is None and getattr(tok, "eos_token", None):
+        tok.pad_token = tok.eos_token
+        _log(f"set pad_token = eos_token ({tok.eos_token})")
+
+    _log("tokenizer ready")
+    return tok
+
 def load_and_tokenize(cfg: Dict[str, Any], save_root: Path, max_train=0, max_val=0):
     disable_hf_transfer()
     from datasets import load_dataset, ClassLabel, DatasetDict, load_from_disk

@@ -31,7 +31,6 @@ def ensure_pip():
         return True
 
 def pip_install(pkgs, index_url=None):
-    """Install packages to user site with visible progress."""
     cmd = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--user", "-U"]
     if index_url:
         cmd += ["--index-url", index_url]
@@ -52,11 +51,6 @@ def installed(mod_name: str) -> bool:
     base = mod_name.split(">=")[0].split("[")[0]
     return pkgutil.find_loader(base) is not None
 def ensure_core_packages():
-    """
-    Fix 'distutils vs setuptools' ordering (Anaconda), then install/upgrade
-    the ML stack into the *user* site and make sure the user site wins on sys.path.
-    Also verifies BitsAndBytesConfig import. Prints verbose locations/versions.
-    """
     import os, sys, subprocess, importlib, site
     from pathlib import Path
 
@@ -204,7 +198,6 @@ def setup_env_and_caches():
         pass
 
 def disable_hf_transfer():
-    """Ensure we use standard tqdm progress (avoid hf_transfer background)."""
     os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
     try:
         from huggingface_hub import constants, file_download

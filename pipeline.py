@@ -676,6 +676,9 @@ def train_eval(cfg: Dict[str, Any]):
         base.gradient_checkpointing_enable()
     from peft import prepare_model_for_kbit_training
     base = prepare_model_for_kbit_training(base)
+    # ensure inputs require grads for gradient checkpointing + k-bit training
+    if hasattr(base, "enable_input_require_grads"):
+        base.enable_input_require_grads()
     hidden_size = getattr(base.config, "hidden_size", None) or getattr(base.config, "hidden_dim", None)
     assert hidden_size, "Could not infer hidden size."
     log(f"Model loaded in {time.time()-t0:.1f}s | hidden_size={hidden_size}", prefix="[MODEL]")
@@ -720,7 +723,14 @@ def train_eval(cfg: Dict[str, Any]):
     steps_per_epoch = math.ceil(len(train_dl) / cfg["grad_accum"])
     total_steps = steps_per_epoch * cfg["epochs"]
     warmup_steps = int(total_steps * cfg["warmup_ratio"])
-    opt = bnb.optim.PagedAdamW8bit(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"], betas=(0.9,0.95), eps=1e-8)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    opt = bnb.optim.PagedAdamW8bit(
+        trainable_params,
+        lr=cfg["lr"],
+        weight_decay=cfg["weight_decay"],
+        betas=(0.9, 0.95),
+        eps=1e-8
+    )
     sch = get_linear_schedule_with_warmup(opt, warmup_steps, total_steps)
     from torch.amp import GradScaler
     scaler = GradScaler('cuda', enabled=(cfg["precision"] == "fp16"))
@@ -889,18 +899,32 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
         backbone.config.use_cache = False
 
 
-    import torch.nn as nn
+    import torch.nn as nn, json as _json
     class SeqClassifier(nn.Module):
         def __init__(self, backbone, hidden, num_labels=2):
-            super().__init__(); self.backbone = backbone; self.cls = nn.Linear(hidden, num_labels)
+            super().__init__()
+            self.backbone = backbone
+            self.cls = nn.Linear(hidden, num_labels)
+            self.num_labels = num_labels
         def forward(self, input_ids=None, attention_mask=None):
-            out = self.backbone(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True, return_dict=True)
-            h = out.hidden_states[-1]; mask = attention_mask.unsqueeze(-1).type_as(h) if attention_mask is not None else None
+            out = self.backbone(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                return_dict=True
+            )
+            h = out.hidden_states[-1]
+            mask = attention_mask.unsqueeze(-1).type_as(h) if attention_mask is not None else None
             pooled = (h * mask).sum(1) / mask.sum(1).clamp(min=1.0) if mask is not None else h[:, -1]
             return self.cls(pooled)
 
-    model = SeqClassifier(backbone, hidden_size, num_labels).to(device)
-    model.cls.load_state_dict(head_state["state_dict"])
+    # Load classifier metadata and weights saved during training
+    head_state = torch.load(best_dir / "classifier.pt", map_location=device)
+    hidden_size = int(head_state.get("hidden_size") or getattr(backbone.config, "hidden_size", None) or getattr(backbone.config, "hidden_dim"))
+    num_labels = int(head_state.get("num_labels", 2))
+
+    model = SeqClassifier(backbone, hidden_size, num_labels=num_labels).to(device)
+    model.cls.load_state_dict(head_state["state_dict"], strict=True)
     model.eval()
 
     loader = val_dl if isinstance(val_dl, DataLoader) else DataLoader(ds_tok["validation"], batch_size=max(1, cfg["batch_size"]*2), shuffle=False, collate_fn=collator)

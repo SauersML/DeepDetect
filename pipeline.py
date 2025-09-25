@@ -25,14 +25,20 @@ DEFAULT_CFG = {
     "weight_decay": 0.01,
     "warmup_ratio": 0.03,
     "max_grad_norm": 1.0,
-    "use_lora": False,
-    "target_mods": "q_proj,k_proj,v_proj,o_proj",
+    "use_lora": True,  # QLoRA on by default
+    # include MLP projections too (Gemma/Llama style names)
+    "target_mods": "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
     "lora_r": 16,
     "lora_alpha": 32,
     "lora_dropout": 0.05,
-    "max_train": 20,
+    # QLoRA-friendly training defaults
+    "lr": 1e-4,
+    "weight_decay": 0.0,
+    "warmup_ratio": 0.06,
+    "max_train": 20, 
     "max_val": 20,
     "wandb": False,
+
     "eval_only": False,
     "resume": False,
 }

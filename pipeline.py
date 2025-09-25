@@ -4,7 +4,6 @@
 import os, sys, time, json, math, re, gc, argparse, importlib, pkgutil, subprocess
 from pathlib import Path
 from typing import Any, Dict
-from peft import prepare_model_for_kbit_training
 from transformers import AutoConfig, AutoModelForCausalLM
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")

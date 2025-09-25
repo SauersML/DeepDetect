@@ -281,6 +281,68 @@ def json_dump(obj, path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f: json.dump(obj, f, indent=2)
 
+def safe_load_tokenizer(model_id: str):
+    import os, json, re, shutil
+    from pathlib import Path
+    from huggingface_hub import snapshot_download
+    from transformers import AutoTokenizer
+
+    def _log(msg): log(f"[TOK] {msg}")
+
+    # Where to keep our patched copy
+    tmp_root = Path(os.environ.get("TMPDIR", "/tmp")) / (os.environ.get("USER", "user") or "user")
+    local_tok_dir = tmp_root / f"tokpatch__{re.sub(r'[^a-zA-Z0-9_.-]+','_',model_id)}"
+    local_tok_dir.mkdir(parents=True, exist_ok=True)
+
+    # Pull only tokenizer files (this uses/creates HF Hub cache; re-runs are instant)
+    allow = ["tokenizer.json", "tokenizer.model", "special_tokens_map.json",
+             "added_tokens.json", "tokenizer_config.json"]
+    _log(f"snapshot_download allow_patterns={allow}")
+    snap_dir = snapshot_download(
+        repo_id=model_id,
+        allow_patterns=allow,
+        cache_dir=os.environ.get("HF_HUB_CACHE")  # respects your configured cache
+    )
+
+    # Copy tokenizer files into a writable spot we can patch
+    for fname in allow:
+        src = Path(snap_dir) / fname
+        if src.exists():
+            shutil.copy2(src, local_tok_dir / fname)
+
+    # Patch tokenizer_config.json if needed
+    cfg_path = local_tok_dir / "tokenizer_config.json"
+    if cfg_path.exists():
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            tok_cfg = json.load(f)
+        ct = tok_cfg.get("chat_template", None)
+        if isinstance(ct, dict):
+            # Prefer the raw template string if present, else drop it
+            if isinstance(ct.get("template"), str):
+                tok_cfg["chat_template"] = ct["template"]
+                _log("patched chat_template: dict → string")
+            else:
+                tok_cfg.pop("chat_template", None)
+                _log("removed invalid chat_template (dict without 'template')")
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump(tok_cfg, f, ensure_ascii=False)
+    else:
+        _log("no tokenizer_config.json present (nothing to patch)")
+
+    # Load tokenizer from the patched local dir
+    try:
+        tok = AutoTokenizer.from_pretrained(str(local_tok_dir), use_fast=True, trust_remote_code=True)
+    except Exception as e:
+        _log(f"fast load failed ({e}) → retrying use_fast=False")
+        tok = AutoTokenizer.from_pretrained(str(local_tok_dir), use_fast=False, trust_remote_code=True)
+
+    if tok.pad_token is None and hasattr(tok, "eos_token") and tok.eos_token:
+        tok.pad_token = tok.eos_token
+        _log(f"set pad_token = eos_token ({tok.eos_token})")
+
+    _log("tokenizer ready")
+    return tok
+
 def load_and_tokenize(cfg: Dict[str, Any], save_root: Path, max_train=0, max_val=0):
     disable_hf_transfer()
     from datasets import load_dataset, ClassLabel, DatasetDict, load_from_disk
@@ -300,7 +362,7 @@ def load_and_tokenize(cfg: Dict[str, Any], save_root: Path, max_train=0, max_val
         with open(tok_cache / "meta.json") as f:
             meta = json.load(f)
         id2label = {int(k): v for k, v in meta["id2label"].items()}
-        tok = AutoTokenizer.from_pretrained(cfg["model_id"], use_fast=True)
+        tok = safe_load_tokenizer(cfg["model_id"])
         collator = DataCollatorWithPadding(tokenizer=tok)
         return ds_tok, collator, id2label
 
@@ -359,7 +421,7 @@ def load_and_tokenize(cfg: Dict[str, Any], save_root: Path, max_train=0, max_val
     ds["validation"] = maybe_take(ds["validation"], max_val)
     log(f"Using: train={len(ds['train'])}, val={len(ds['validation'])}", prefix="[DATA]")
 
-    tok = AutoTokenizer.from_pretrained(cfg["model_id"], use_fast=True)
+    tok = safe_load_tokenizer(cfg["model_id"])
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     max_len = int(cfg["max_length"])

@@ -4,6 +4,8 @@
 import os, sys, time, json, math, re, gc, importlib, pkgutil, subprocess
 from pathlib import Path
 from typing import Any, Dict
+from transformers import AutoModelForCausalLM  # add near top of file if not already imported
+
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
@@ -810,11 +812,13 @@ def train_eval(cfg: Dict[str, Any]):
         if valm["f1_macro"] > best_f1:
             best_f1 = valm["f1_macro"]
             best_dir.mkdir(parents=True, exist_ok=True)
-            # 1) save LoRA
-            if hasattr(model.backbone, "save_pretrained"):  # PEFT model
-                model.backbone.save_pretrained(best_dir / "lora_adapter")
+            # 1) save backbone / adapters
+            if cfg["use_lora"]:
+                # Save only the LoRA adapters (produces adapter_config.json + adapter_model.safetensors)
+                model.backbone.save_pretrained(str(best_dir / "lora_adapter"))
             else:
-                backbone.save_pretrained(best_dir / "lora_adapter")
+                # Not using LoRA → save the full backbone weights for eval/resume
+                base.save_pretrained(str(best_dir / "backbone"))
             # 2) save classifier head
             torch.save(
                 {"state_dict": model.cls.state_dict(), "hidden_size": hidden_size, "num_labels": model.num_labels},
@@ -854,14 +858,30 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
                                    bnb_4bit_compute_dtype=base_dtype, bnb_4bit_use_double_quant=True)
     except Exception:
         quant = None
-
+    
+    
     log("Reloading best checkpoint …", prefix="[EVAL]")
-    base = safe_load_backbone(cfg["model_id"], base_dtype, quant)
-    base.config.output_hidden_states = True; base.config.use_cache = False
-    peft = PeftModel.from_pretrained(base, best_dir / "lora_adapter")
+    
+    if cfg["use_lora"]:
+        base = safe_load_backbone(cfg["model_id"], base_dtype, quant)
+        base.config.output_hidden_states = True; base.config.use_cache = False
+        backbone = PeftModel.from_pretrained(base, str(best_dir / "lora_adapter"))  # str() avoids HFValidationError
+    else:
+        backbone_dir = best_dir / "backbone"
+        if backbone_dir.exists():
+            # Reload the finetuned backbone we saved
+            backbone = AutoModelForCausalLM.from_pretrained(
+                str(backbone_dir),
+                torch_dtype=base_dtype,
+                device_map={"": 0}
+            )
+        else:
+            # Fallback: use the base model from the hub (won’t include finetuning)
+            print("NO FINE-TUNING APPLIED")
+            backbone = safe_load_backbone(cfg["model_id"], base_dtype, quant)
+        backbone.config.output_hidden_states = True
+        backbone.config.use_cache = False
 
-    head_state = torch.load(best_dir / "classifier.pt", map_location="cpu")
-    hidden_size = head_state.get("hidden_size"); num_labels = head_state.get("num_labels", 2)
 
     import torch.nn as nn
     class SeqClassifier(nn.Module):
@@ -873,7 +893,7 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
             pooled = (h * mask).sum(1) / mask.sum(1).clamp(min=1.0) if mask is not None else h[:, -1]
             return self.cls(pooled)
 
-    model = SeqClassifier(peft, hidden_size, num_labels).to(device)
+    model = SeqClassifier(backbone, hidden_size, num_labels).to(device)
     model.cls.load_state_dict(head_state["state_dict"])
     model.eval()
 

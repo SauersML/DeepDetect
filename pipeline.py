@@ -5,6 +5,9 @@ import os, sys, time, json, math, re, gc, argparse, importlib, pkgutil, subproce
 from pathlib import Path
 from typing import Any, Dict
 
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+
 # ---------------------------
 # [A] SUPER-VERBOSE LOGGING
 # ---------------------------

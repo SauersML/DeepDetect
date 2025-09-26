@@ -3,7 +3,7 @@
 
 import os, sys, time, json, math, re, gc, importlib, pkgutil, subprocess
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 from transformers import AutoModelForCausalLM
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -18,8 +18,12 @@ DEFAULT_CFG = {
     "seed": 42,
     "max_length": 256,
     "epochs": 1,
-    "batch_size": 2,
+    "batch_size": 16,
     "grad_accum": 1,
+    "gradient_checkpointing": False,
+    "attn_impl": None,
+    "torch_compile": True,
+    "log_interval": 50,
     "max_grad_norm": 1.0,
     "use_lora": True, # QLoRA on by default
     # include MLP projections too (Gemma/Llama style names)
@@ -442,7 +446,16 @@ def safe_load_tokenizer(model_id: str):
 
 from transformers import AutoConfig, AutoModelForCausalLM
 
-def safe_load_backbone(model_id: str, base_dtype, quant, *, device_map=None, trust_remote_code: bool = False):
+def safe_load_backbone(
+    model_id: str,
+    base_dtype,
+    quant,
+    *,
+    device_map=None,
+    trust_remote_code: bool = False,
+    attn_impl: Optional[str] = None,
+    gradient_checkpointing: bool = False,
+):
     if device_map is None:
         device_map = {"": 0}
 
@@ -450,16 +463,11 @@ def safe_load_backbone(model_id: str, base_dtype, quant, *, device_map=None, tru
     if hasattr(cfg, "auto_map"):
         cfg.auto_map = None
 
-    # Prefer 'eager' attention on pre-Ampere (SM < 80) to avoid fp16 instability; log the choice.
-    attn_impl = "sdpa"
-    try:
-        import torch as _t
-        maj, _ = _t.cuda.get_device_capability(0)
-        if maj < 8:
-            attn_impl = "eager"
-    except Exception:
-        pass
-    log(f"attn_implementation={attn_impl}", prefix="[MODEL]")
+    if attn_impl:
+        chosen_attn = attn_impl
+    else:
+        chosen_attn = "eager" if "gemma-3" in model_id.lower() else "sdpa"
+    log(f"attn_implementation={chosen_attn}", prefix="[MODEL]")
 
     # >>> disable PEFT autoload only for this call <<<
     with _disable_peft_autoload():
@@ -470,13 +478,13 @@ def safe_load_backbone(model_id: str, base_dtype, quant, *, device_map=None, tru
             torch_dtype=(None if quant else base_dtype),
             device_map=device_map,
             trust_remote_code=trust_remote_code,
-            attn_implementation=attn_impl,
+            attn_implementation=chosen_attn,
         )
 
     # training-time prefs
-    model.config.output_hidden_states = True
+    model.config.output_hidden_states = False
     model.config.use_cache = False
-    if hasattr(model, "gradient_checkpointing_enable"):
+    if gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False}
         )
@@ -502,7 +510,7 @@ def load_and_tokenize(cfg: Dict[str, Any], save_root: Path, max_train=0, max_val
             meta = json.load(f)
         id2label = {int(k): v for k, v in meta["id2label"].items()}
         tok = safe_load_tokenizer(cfg["model_id"])
-        collator = DataCollatorWithPadding(tokenizer=tok)
+        collator = DataCollatorWithPadding(tokenizer=tok, pad_to_multiple_of=8)
         return ds_tok, collator, id2label
 
     hline("[DATA] Downloading/reading dataset")
@@ -598,7 +606,7 @@ def load_and_tokenize(cfg: Dict[str, Any], save_root: Path, max_train=0, max_val
     ds_tok = HF_DatasetDict(**ds_tok)
 
     from transformers import DataCollatorWithPadding
-    collator = DataCollatorWithPadding(tokenizer=tok)
+    collator = DataCollatorWithPadding(tokenizer=tok, pad_to_multiple_of=8)
     y_counts = Counter(ds_tok["train"]["labels"])
     log("Label dist (train): " + str({id2label[k]: v for k, v in sorted(y_counts.items())}), prefix="[DATA]")
 
@@ -629,24 +637,29 @@ def train_eval(cfg: Dict[str, Any]):
 
     # Data
     ds_tok, collator, id2label = load_and_tokenize(cfg, save_root, cfg["max_train"], cfg["max_val"])
-    # Index of the AI class (used everywhere we compute prob_ai)
-    ai_idx = int([k for k, v in id2label.items() if str(v).upper() == "AI"][0])
-
-    # Drop non-tensor fields (like 'raw_text') during batching for train/val
-    def collate_drop_text(features):
-        feats = [{k: v for k, v in f.items() if k != "raw_text"} for f in features]
-        return collator(feats)
-
     # drop the non-tensor column from the training split (prevents 'raw_text' from reaching the collator)
     train_ds = ds_tok["train"].remove_columns([c for c in ds_tok["train"].column_names if c == "raw_text"])
+
+    cpu_count = os.cpu_count() or 8
+    if cpu_count <= 1:
+        loader_workers = 1
+    else:
+        loader_workers = min(16, max(2, cpu_count))
+    dl_common = {
+        "pin_memory": True,
+        "pin_memory_device": "cuda",
+        "num_workers": loader_workers,
+        "persistent_workers": loader_workers > 0,
+    }
+    if loader_workers > 0:
+        dl_common["prefetch_factor"] = 4
+
     train_dl = DataLoader(
         train_ds,
         batch_size=cfg["batch_size"],
         shuffle=True,
         collate_fn=collator,  # DataCollatorWithPadding
-        pin_memory=True,
-        num_workers=0,
-        persistent_workers=False,
+        **dl_common,
     )
     
     val_bs = max(1, cfg["batch_size"] * 2)
@@ -657,9 +670,7 @@ def train_eval(cfg: Dict[str, Any]):
         batch_size=val_bs,
         shuffle=False,
         collate_fn=collator,  # DataCollatorWithPadding
-        pin_memory=True,
-        num_workers=0,
-        persistent_workers=False,
+        **dl_common,
     )
 
 
@@ -673,16 +684,17 @@ def train_eval(cfg: Dict[str, Any]):
             return
 
     # Precision & GPU info
-    import torch as _t
     if cfg["precision"] is None:
-        cfg["precision"] = "bf16" if _t.cuda.is_bf16_supported() else "fp16"
-    _t.set_float32_matmul_precision("medium")
+        cfg["precision"] = "bf16" if torch.cuda.is_bf16_supported() else "fp16"
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
     log(f"Precision: {cfg['precision']}", prefix="[TRAIN]")
 
     # Quantization choice (no regex, no try/except)
     from packaging.version import Version
-    
-    base_dtype = _t.bfloat16 if cfg["precision"] == "bf16" else _t.float16
+
+    base_dtype = torch.bfloat16 if cfg["precision"] == "bf16" else torch.float16
     
     # Normalize version like "0.43.1+cu124" or "0.43.1-foo" → "0.43.1"
     bnb_version_raw = getattr(bnb, "__version__", "0.0.0")
@@ -706,21 +718,20 @@ def train_eval(cfg: Dict[str, Any]):
     # Model load + WARM-START (weights only; fresh optimizer/schedule every run)
     t0 = time.time()
     log(f"Loading base model: {cfg['model_id']}", prefix="[MODEL]")
-    base = safe_load_backbone(cfg["model_id"], base_dtype, quant)
-    base.config.output_hidden_states = True
-    base.config.use_cache = False
-    if hasattr(base, "gradient_checkpointing_enable"):
-        base.gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs={"use_reentrant": False}
-        )
-    from peft import prepare_model_for_kbit_training
-    base = prepare_model_for_kbit_training(
-        base,
-        use_gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={"use_reentrant": False},
+    grad_ckpt = bool(cfg.get("gradient_checkpointing", False))
+    base = safe_load_backbone(
+        cfg["model_id"],
+        base_dtype,
+        quant,
+        attn_impl=cfg.get("attn_impl"),
+        gradient_checkpointing=grad_ckpt,
     )
-    # ensure inputs require grads for gradient checkpointing + k-bit training
-    if hasattr(base, "enable_input_require_grads"):
+    from peft import prepare_model_for_kbit_training
+    prepare_kwargs = {"use_gradient_checkpointing": grad_ckpt}
+    if grad_ckpt:
+        prepare_kwargs["gradient_checkpointing_kwargs"] = {"use_reentrant": False}
+    base = prepare_model_for_kbit_training(base, **prepare_kwargs)
+    if grad_ckpt and hasattr(base, "enable_input_require_grads"):
         base.enable_input_require_grads()
 
     warm_used = False
@@ -741,14 +752,9 @@ def train_eval(cfg: Dict[str, Any]):
                     torch_dtype=base_dtype,
                     device_map={"": 0}
                 )
-                backbone.config.output_hidden_states = True
+                backbone.config.output_hidden_states = False
                 backbone.config.use_cache = False
-                # prepare for k-bit if training full model
-                backbone = prepare_model_for_kbit_training(
-                    backbone,
-                    use_gradient_checkpointing=True,
-                    gradient_checkpointing_kwargs={"use_reentrant": False},
-                )
+                backbone = prepare_model_for_kbit_training(backbone, **prepare_kwargs)
                 warm_used = True
             else:
                 warm_notes.append("no_compatible_artifact_in_best_dir")
@@ -784,9 +790,10 @@ def train_eval(cfg: Dict[str, Any]):
             self.cls = nn.Linear(hidden, num_labels)
             self.num_labels = num_labels
         def forward(self, input_ids=None, attention_mask=None, labels=None):
-            out = self.backbone(input_ids=input_ids, attention_mask=attention_mask,
-                                output_hidden_states=True, return_dict=True)
-            h = out.hidden_states[-1]
+            base_model = getattr(self.backbone, "base_model", self.backbone)
+            encoder = getattr(base_model, "model", base_model)
+            out = encoder(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
+            h = out.last_hidden_state
             if attention_mask is None:
                 pooled = h[:, -1]
             else:
@@ -833,18 +840,45 @@ def train_eval(cfg: Dict[str, Any]):
     if warm_notes:
         log("WARM-START notes: " + ", ".join(warm_notes), prefix="[WARM]")
 
+    if cfg.get("torch_compile", True) and hasattr(torch, "compile"):
+        try:
+            model = torch.compile(model, mode="reduce-overhead", dynamic=True, fullgraph=False)
+            log("torch.compile enabled", prefix="[OPT]")
+        except Exception as e:
+            log(f"torch.compile disabled: {type(e).__name__}: {e}", prefix="[OPT]")
+
     # Optim & sched
     steps_per_epoch = math.ceil(len(train_dl) / cfg["grad_accum"])
     total_steps = steps_per_epoch * cfg["epochs"]
     warmup_steps = int(total_steps * cfg["warmup_ratio"])
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    opt = bnb.optim.PagedAdamW8bit(
-        trainable_params,
-        lr=cfg["lr"],
-        weight_decay=cfg["weight_decay"],
-        betas=(0.9, 0.95),
-        eps=1e-8
-    )
+    total_trainable = sum(p.numel() for p in trainable_params)
+    opt = None
+    if total_trainable < 30_000_000:
+        try:
+            opt = torch.optim.AdamW(
+                trainable_params,
+                lr=cfg["lr"],
+                weight_decay=cfg["weight_decay"],
+                fused=True,
+            )
+            log("Optimizer: AdamW (fused)", prefix="[OPT]")
+        except (TypeError, RuntimeError, ValueError):
+            opt = torch.optim.AdamW(
+                trainable_params,
+                lr=cfg["lr"],
+                weight_decay=cfg["weight_decay"],
+            )
+            log("Optimizer: AdamW", prefix="[OPT]")
+    if opt is None:
+        opt = bnb.optim.PagedAdamW8bit(
+            trainable_params,
+            lr=cfg["lr"],
+            weight_decay=cfg["weight_decay"],
+            betas=(0.9, 0.95),
+            eps=1e-8
+        )
+        log("Optimizer: PagedAdamW8bit", prefix="[OPT]")
     sch = get_linear_schedule_with_warmup(opt, warmup_steps, total_steps)
     from torch.amp import GradScaler
     scaler = GradScaler('cuda', enabled=(cfg["precision"] == "fp16"))
@@ -863,7 +897,7 @@ def train_eval(cfg: Dict[str, Any]):
         total_loss, nb = 0.0, 0
         ys, yps, yhats = [], [], []
         pbar = tqdm(loader, desc="Validating", unit="batch", leave=False)
-        import numpy as np, torch as _t
+        import numpy as np
         for batch in pbar:
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             attention_mask = batch.get("attention_mask")
@@ -880,7 +914,7 @@ def train_eval(cfg: Dict[str, Any]):
             ys.append(labels.cpu()); yps.append(prob_ai.cpu()); yhats.append(pred.cpu())
             # live validation metrics on processed batches so far
             try:
-                y_sofar = _t.cat(ys).numpy(); p_sofar = _t.cat(yps).numpy(); yhat_sofar = _t.cat(yhats).numpy()
+                y_sofar = torch.cat(ys).numpy(); p_sofar = torch.cat(yps).numpy(); yhat_sofar = torch.cat(yhats).numpy()
                 acc_sofar = accuracy_score(y_sofar, yhat_sofar)
                 f1_sofar = f1_score(y_sofar, yhat_sofar, average="macro")
                 try: auc_sofar = roc_auc_score(y_sofar, p_sofar)
@@ -893,8 +927,8 @@ def train_eval(cfg: Dict[str, Any]):
                 })
             except Exception:
                 pbar.set_postfix({"loss": f"{total_loss/max(1,nb):.4f}"})
-        import numpy as np, torch as _t
-        y = _t.cat(ys).numpy(); p = _t.cat(yps).numpy(); yhat = _t.cat(yhats).numpy()
+        import numpy as np
+        y = torch.cat(ys).numpy(); p = torch.cat(yps).numpy(); yhat = torch.cat(yhats).numpy()
         acc = accuracy_score(y, yhat); f1m = f1_score(y, yhat, average="macro")
         try: auc = roc_auc_score(y, p)
         except Exception: auc = float("nan")
@@ -958,10 +992,13 @@ def train_eval(cfg: Dict[str, Any]):
         torch.cuda.empty_cache(); gc.collect()
         model.train()
 
+    log_interval = max(1, int(cfg.get("log_interval", 50)))
     for epoch in range(1, cfg["epochs"] + 1):
         model.train()
-        running = 0.0
-        ys_run, yps_run, yhats_run = [], [], []  # epoch-to-date for live train metrics
+        running_loss = 0.0
+        running_correct = 0
+        running_examples = 0
+        interval_steps = 0
         batches = tqdm(train_dl, desc=f"Epoch {epoch}/{cfg['epochs']}", unit="batch")
 
         opt.zero_grad(set_to_none=True)
@@ -976,14 +1013,8 @@ def train_eval(cfg: Dict[str, Any]):
                 out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
                 raw_loss = float(out["loss"].detach().item())
                 loss = out["loss"] / cfg["grad_accum"]
-                logits = out["logits"].detach().float()
-                prob_ai = torch.softmax(logits, dim=-1)[:, 1]
-                pred = logits.argmax(-1)
-
-            # accumulate for live train metrics
-            ys_run.append(labels.detach().cpu())
-            yps_run.append(prob_ai.detach().cpu())
-            yhats_run.append(pred.detach().cpu())
+                logits_detached = out["logits"].detach()
+                preds = logits_detached.argmax(-1)
 
             if cfg["precision"] == "fp16":
                 scaler.scale(loss).backward()
@@ -1001,7 +1032,10 @@ def train_eval(cfg: Dict[str, Any]):
                 sch.step()
                 opt.zero_grad(set_to_none=True)
 
-            running += float(loss.item())
+            running_loss += raw_loss
+            running_correct += (preds == labels).sum().item()
+            running_examples += labels.numel()
+            interval_steps += 1
             global_step += 1
             n_steps_seen += 1
             total_loss_sum += raw_loss
@@ -1022,36 +1056,28 @@ def train_eval(cfg: Dict[str, Any]):
                 "warm_start_used": bool(warm_used)
             })
 
-            if step % (cfg["grad_accum"] * 5) == 0:
-                avg = running / (cfg["grad_accum"] * 5)
-                import torch as _t, numpy as _np
-                from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
-                y_tr = _t.cat(ys_run).numpy()
-                p_tr = _t.cat(yps_run).numpy()
-                yhat_tr = _t.cat(yhats_run).numpy()
-                acc_tr = accuracy_score(y_tr, yhat_tr)
-                f1_tr = f1_score(y_tr, yhat_tr, average="macro")
-                try: auc_tr = roc_auc_score(y_tr, p_tr)
-                except Exception: auc_tr = float("nan")
+            if step % log_interval == 0:
+                denom = max(1, interval_steps)
+                avg_loss = running_loss / denom
+                acc = running_correct / max(1, running_examples)
                 batches.set_postfix({
-                    "train_loss": f"{avg:.4f}",
-                    "acc": f"{acc_tr:.3f}",
-                    "f1": f"{f1_tr:.3f}",
-                    "auc": f"{auc_tr:.3f}",
+                    "train_loss": f"{avg_loss:.4f}",
+                    "acc": f"{acc:.3f}",
                     "lr": f"{sch.get_last_lr()[0]:.2e}"
                 })
                 if cfg["wandb"]:
                     import wandb
                     wandb.log({
-                        "train/loss": avg,
+                        "train/loss": avg_loss,
                         "train/lr": sch.get_last_lr()[0],
-                        "train/acc": acc_tr,
-                        "train/f1_macro": f1_tr,
-                        "train/auroc": auc_tr,
+                        "train/acc": acc,
                         "train/step": (epoch-1)*steps_per_epoch + step,
                         "global_step": global_step,
                     })
-                running = 0.0
+                running_loss = 0.0
+                running_correct = 0
+                running_examples = 0
+                interval_steps = 0
 
             # ---- mid-epoch evaluation every N batches ----
             if eval_every and (global_step % eval_every == 0):
@@ -1089,9 +1115,6 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
     assert best_dir.exists(), f"Best dir not found: {best_dir}"
     device = torch.device("cuda")
     base_dtype = torch.bfloat16 if cfg["precision"] == "bf16" else torch.float16
-    # Index of the AI class for probability computation
-    ai_idx = int([k for k, v in id2label.items() if str(v).upper() == "AI"][0])
-
     # Light quant reload
     try:
         quant = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
@@ -1102,9 +1125,13 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
     log("Reloading best checkpoint …", prefix="[EVAL]")
 
     if cfg["use_lora"]:
-        base = safe_load_backbone(cfg["model_id"], base_dtype, quant)
-        base.config.output_hidden_states = True
-        base.config.use_cache = False
+        base = safe_load_backbone(
+            cfg["model_id"],
+            base_dtype,
+            quant,
+            attn_impl=cfg.get("attn_impl"),
+            gradient_checkpointing=False,
+        )
         backbone = PeftModel.from_pretrained(base, str(best_dir / "lora_adapter"))
         # Keep numerically sensitive ops (e.g., LayerNorm) in fp32 for k-bit eval
         backbone = prepare_model_for_kbit_training(backbone, use_gradient_checkpointing=False)
@@ -1118,8 +1145,14 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
             )
         else:
             print("NO FINE-TUNING APPLIED")
-            backbone = safe_load_backbone(cfg["model_id"], base_dtype, quant)
-        backbone.config.output_hidden_states = True
+            backbone = safe_load_backbone(
+                cfg["model_id"],
+                base_dtype,
+                quant,
+                attn_impl=cfg.get("attn_impl"),
+                gradient_checkpointing=False,
+            )
+        backbone.config.output_hidden_states = False
         backbone.config.use_cache = False
         # Same stabilization even without LoRA
         backbone = prepare_model_for_kbit_training(backbone, use_gradient_checkpointing=False)
@@ -1151,13 +1184,10 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
             self.cls = nn.Linear(hidden, num_labels)
             self.num_labels = num_labels
         def forward(self, input_ids=None, attention_mask=None):
-            out = self.backbone(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
-                return_dict=True
-            )
-            h = out.hidden_states[-1]
+            base_model = getattr(self.backbone, "base_model", self.backbone)
+            encoder = getattr(base_model, "model", base_model)
+            out = encoder(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
+            h = out.last_hidden_state
             if attention_mask is not None:
                 mask = attention_mask.unsqueeze(-1).type_as(h)
                 pooled = (h * mask).sum(1) / mask.sum(1).clamp(min=1.0)
@@ -1181,13 +1211,26 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
         return batch
 
     eval_ds = ds_tok["validation"]
+    cpu_count = os.cpu_count() or 8
+    if cpu_count <= 1:
+        eval_workers = 1
+    else:
+        eval_workers = min(16, max(2, cpu_count))
+    eval_dl_kwargs = {
+        "pin_memory": True,
+        "pin_memory_device": "cuda",
+        "num_workers": eval_workers,
+        "persistent_workers": eval_workers > 0,
+    }
+    if eval_workers > 0:
+        eval_dl_kwargs["prefetch_factor"] = 4
+
     loader = DataLoader(
         eval_ds,
         batch_size=max(1, cfg["batch_size"]*2),
         shuffle=False,
         collate_fn=collate_keep_text,
-        num_workers=0,
-        persistent_workers=False,
+        **eval_dl_kwargs,
     )
     log(f"[EVAL] Using split=validation | n={len(eval_ds)} | batch_size={max(1, cfg['batch_size']*2)}", prefix="")
 
@@ -1283,7 +1326,13 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
     extra = [k for k in ds_tok.keys() if k not in ("train", "validation")]
     for split in extra:
         ds_split = ds_tok[split]
-        loader = DataLoader(ds_split, batch_size=max(1, cfg["batch_size"]*2), shuffle=False, collate_fn=collate_keep_text)
+        loader = DataLoader(
+            ds_split,
+            batch_size=max(1, cfg["batch_size"]*2),
+            shuffle=False,
+            collate_fn=collate_keep_text,
+            **eval_dl_kwargs,
+        )
         ys, yps, yhats = [], [], []
         for batch in loader:
             input_ids = batch["input_ids"].to(device, non_blocking=True)
@@ -1301,11 +1350,11 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
             pred = logits.argmax(-1)
             ys.append(batch["labels"].cpu()); yps.append(prob_ai.cpu()); yhats.append(pred.cpu())
 
-        import numpy as _np, torch as _t
-        y = _t.cat(ys).numpy(); p = _t.cat(yps).numpy(); yhat = _t.cat(yhats).numpy()
+        import numpy as np
+        y = torch.cat(ys).numpy(); p = torch.cat(yps).numpy(); yhat = torch.cat(yhats).numpy()
         from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
         acc = accuracy_score(y, yhat); f1m = f1_score(y, yhat, average="macro")
-        uniq, _ = _np.unique(y, return_counts=True)
+        uniq, _ = np.unique(y, return_counts=True)
         if len(uniq) == 2:
             try:
                 auc = roc_auc_score(y, p)

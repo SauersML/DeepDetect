@@ -1310,7 +1310,7 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
     label_names = {k: id2label.get(int(k), str(k)) for k in counts_map.keys()}
     log(f"[EVAL] Class counts (validation): " + str({label_names[k]: counts_map[k] for k in counts_map}), prefix="")
 
-    # Metrics (guard AUC when single-class)
+    # Metrics (guard AUC when single-class) — ARGMAX baseline
     acc = accuracy_score(y, yhat)
     f1m = f1_score(y, yhat, average="macro")
     if len(uniq) == 2:
@@ -1322,7 +1322,7 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
         log("[EVAL] Only one class present in labels; ROC-AUC is undefined. Increase max_val or ensure stratification.", prefix="")
         auc = float("nan")
 
-    log(f"acc={acc:.4f} | f1_macro={f1m:.4f} | auroc={auc:.4f}", prefix="[BEST]")
+    log(f"[VAL/ARGMAX] acc={acc:.4f} | f1_macro={f1m:.4f} | auroc={auc:.4f}", prefix="[BEST]")
     _append_metric(best_dir.parent, {
         "run_id": cfg.get("run_id"),
         "timestamp": time.time(),
@@ -1335,7 +1335,31 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
         "auroc": (None if (auc != auc) else float(auc))
     })
 
-    # Error analysis: print up to 20 misclassified examples with confidence
+    # ---- Threshold sweep on validation (maximize macro-F1 over P(class==1)) ----
+    ts = np.linspace(0.0, 1.0, 101)
+    best_t, best_f1 = 0.5, -1.0
+    best_acc = None
+    for t in ts:
+        yhat_t = (p >= t).astype(int)
+        f1_t = f1_score(y, yhat_t, average="macro")
+        if f1_t > best_f1:
+            best_f1 = f1_t
+            best_t = float(t)
+            best_acc = accuracy_score(y, yhat_t)
+
+    threshold_info = {
+        "prob_is_class_1": True,  # p = softmax(logits)[:, 1]
+        "class1_name": id2label.get(1, "1"),
+        "best_threshold": best_t,
+        "val_f1_macro_at_best": float(best_f1),
+        "val_acc_at_best": float(best_acc),
+        "search_grid": {"start": 0.0, "stop": 1.0, "num": 101},
+        "note": "If your positive class is AI and mapped to label 0, remember p is P(class==1)."
+    }
+    json_dump(threshold_info, best_dir / "threshold.json")
+    log(f"[VAL/THRESH] t*={best_t:.2f} | f1_macro={best_f1:.4f} | acc={best_acc:.4f}", prefix="[BEST]")
+
+    # Error analysis: print up to 20 misclassified examples (by argmax) with confidence p(class==1)
     mis_idx = np.where(yhat != y)[0].tolist()
     log(f"[EVAL] Misclassified examples: {len(mis_idx)}", prefix="")
     max_print = min(20, len(mis_idx))
@@ -1347,14 +1371,24 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
         snippet = texts_all[j].replace("\n", " ")
         if len(snippet) > 300:
             snippet = snippet[:300]
-        log(f"[ERR] gold={gold_name} pred={pred_name} prob_ai={conf:.4f} | text={snippet}", prefix="")
+        log(f"[ERR] gold={gold_name} pred={pred_name} p(class==1)={conf:.4f} | text={snippet}", prefix="")
 
+    # Save predictions and both metric flavors (argmax + thresholded)
     pred_dir = best_dir / "preds"; pred_dir.mkdir(parents=True, exist_ok=True)
     np.save(pred_dir / "val_labels.npy", y)
-    np.save(pred_dir / "val_prob_ai.npy", p)
-    np.save(pred_dir / "val_pred.npy", yhat)
+    np.save(pred_dir / "val_prob_ai.npy", p)  # NOTE: p is P(class==1)
+    np.save(pred_dir / "val_pred.npy", yhat)  # argmax predictions
+
+    # Argmax baseline
     json_dump({"acc": acc, "f1_macro": f1m, "auroc": auc, "class_counts": counts_map}, pred_dir / "metrics.json")
-    log(f"Saved preds + metrics → {pred_dir}", prefix="[SAVE]")
+    # Calibrated at best threshold
+    json_dump({
+        "threshold": best_t,
+        "acc": float(best_acc),
+        "f1_macro": float(best_f1)
+    }, pred_dir / "metrics_thresh.json")
+
+    log(f"Saved preds + metrics (+threshold) → {pred_dir}", prefix="[SAVE]")
 
     # Also evaluate extra splits (test / OOD) with the same guards
     extra = [k for k in ds_tok.keys() if k not in ("train", "validation")]
@@ -1387,6 +1421,8 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
         import numpy as np
         y = torch.cat(ys).numpy(); p = torch.cat(yps).numpy(); yhat = torch.cat(yhats).numpy()
         from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
+
+        # ARGMAX baseline
         acc = accuracy_score(y, yhat); f1m = f1_score(y, yhat, average="macro")
         uniq, _ = np.unique(y, return_counts=True)
         if len(uniq) == 2:
@@ -1396,7 +1432,21 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
                 auc = float("nan")
         else:
             auc = float("nan")
-        json_dump({"acc": acc, "f1_macro": f1m, "auroc": auc}, best_dir / "preds" / f"{split}_metrics.json")
+
+        # THRESHOLDED metrics (use validation-derived threshold if available)
+        thr_path = best_dir / "threshold.json"
+        if thr_path.exists():
+            thr = json.load(open(thr_path))["best_threshold"]
+        else:
+            thr = 0.5
+        yhat_thr = (p >= float(thr)).astype(int)
+        acc_thr = accuracy_score(y, yhat_thr)
+        f1_thr = f1_score(y, yhat_thr, average="macro")
+
+        # Save both flavors
+        out_dir = best_dir / "preds"
+        json_dump({"acc": acc, "f1_macro": f1m, "auroc": auc}, out_dir / f"{split}_metrics.json")
+        json_dump({"threshold": float(thr), "acc": float(acc_thr), "f1_macro": float(f1_thr)}, out_dir / f"{split}_metrics_thresh.json")
 
 
 def maybe_login(do_login: bool):

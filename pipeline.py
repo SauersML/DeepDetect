@@ -919,32 +919,29 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
                                    bnb_4bit_compute_dtype=base_dtype, bnb_4bit_use_double_quant=True)
     except Exception:
         quant = None
-    
-    
+
     log("Reloading best checkpoint …", prefix="[EVAL]")
-    
+
     if cfg["use_lora"]:
         base = safe_load_backbone(cfg["model_id"], base_dtype, quant)
-        base.config.output_hidden_states = True; base.config.use_cache = False
-        backbone = PeftModel.from_pretrained(base, str(best_dir / "lora_adapter"))  # str() avoids HFValidationError
+        base.config.output_hidden_states = True
+        base.config.use_cache = False
+        backbone = PeftModel.from_pretrained(base, str(best_dir / "lora_adapter"))
     else:
         backbone_dir = best_dir / "backbone"
         if backbone_dir.exists():
-            # Reload the finetuned backbone we saved
             backbone = AutoModelForCausalLM.from_pretrained(
                 str(backbone_dir),
                 torch_dtype=base_dtype,
                 device_map={"": 0}
             )
         else:
-            # Fallback: use the base model from the hub (won’t include finetuning)
             print("NO FINE-TUNING APPLIED")
             backbone = safe_load_backbone(cfg["model_id"], base_dtype, quant)
         backbone.config.output_hidden_states = True
         backbone.config.use_cache = False
 
-
-    import torch.nn as nn, json as _json
+    import torch.nn as nn
     class SeqClassifier(nn.Module):
         def __init__(self, backbone, hidden, num_labels=2):
             super().__init__()
@@ -959,11 +956,13 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
                 return_dict=True
             )
             h = out.hidden_states[-1]
-            mask = attention_mask.unsqueeze(-1).type_as(h) if attention_mask is not None else None
-            pooled = (h * mask).sum(1) / mask.sum(1).clamp(min=1.0) if mask is not None else h[:, -1]
+            if attention_mask is not None:
+                mask = attention_mask.unsqueeze(-1).type_as(h)
+                pooled = (h * mask).sum(1) / mask.sum(1).clamp(min=1.0)
+            else:
+                pooled = h[:, -1]
             return self.cls(pooled)
 
-    # Load classifier metadata and weights saved during training
     head_state = torch.load(best_dir / "classifier.pt", map_location=device)
     hidden_size = int(head_state.get("hidden_size") or getattr(backbone.config, "hidden_size", None) or getattr(backbone.config, "hidden_dim"))
     num_labels = int(head_state.get("num_labels", 2))
@@ -972,64 +971,119 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
     model.cls.load_state_dict(head_state["state_dict"], strict=True)
     model.eval()
 
-    loader = val_dl if isinstance(val_dl, DataLoader) else DataLoader(
-        ds_tok["validation"],
+    # Build an eval DataLoader that preserves raw_text for error analysis
+    def collate_keep_text(features):
+        texts = [f.get("raw_text", "") for f in features]
+        batch = collator(features)
+        batch["raw_text"] = texts
+        return batch
+
+    eval_ds = ds_tok["validation"]
+    loader = DataLoader(
+        eval_ds,
         batch_size=max(1, cfg["batch_size"]*2),
         shuffle=False,
-        collate_fn=collator,
+        collate_fn=collate_keep_text,
         num_workers=0,
         persistent_workers=False,
     )
+    log(f"[EVAL] Using split=validation | n={len(eval_ds)} | batch_size={max(1, cfg['batch_size']*2)}", prefix="")
 
-    ys, yps, yhats = [], [], []
+    ys, yps, yhats, texts_all = [], [], [], []
     pbar = tqdm(loader, desc="Eval(best)", unit="batch", leave=False)
     for batch in pbar:
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         attention_mask = batch.get("attention_mask")
-        if attention_mask is not None: attention_mask = attention_mask.to(device, non_blocking=True)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device, non_blocking=True)
         labels = batch["labels"].to(device, non_blocking=True)
+        raw_text = batch.get("raw_text", [])
         from torch.amp import autocast
         with torch.no_grad(), autocast('cuda', dtype=base_dtype):
             logits = model(input_ids=input_ids, attention_mask=attention_mask).float()
         prob_ai = torch.softmax(logits, dim=-1)[:, 1]
+        if torch.isnan(prob_ai).any():
+            n_nans = int(torch.isnan(prob_ai).sum().item())
+            log(f"[EVAL] Detected {n_nans} NaN probabilities → replacing NaN with 0.5", prefix="")
+            prob_ai = torch.nan_to_num(prob_ai, nan=0.5, posinf=1.0, neginf=0.0)
         pred = logits.argmax(-1)
-        ys.append(labels.cpu()); yps.append(prob_ai.cpu()); yhats.append(pred.cpu())
+        ys.append(labels.cpu()); yps.append(prob_ai.cpu()); yhats.append(pred.cpu()); texts_all.extend(raw_text)
 
-    y = torch.cat(ys).numpy(); p = torch.cat(yps).numpy(); yhat = torch.cat(yhats).numpy()
-    acc = accuracy_score(y, yhat); f1m = f1_score(y, yhat, average="macro")
-    try: auc = roc_auc_score(y, p)
-    except Exception: auc = float("nan")
+    y = torch.cat(ys).numpy()
+    p = torch.cat(yps).numpy()
+    yhat = torch.cat(yhats).numpy()
+
+    # Print class counts for the evaluated split
+    uniq, cnts = np.unique(y, return_counts=True)
+    counts_map = {int(k): int(v) for k, v in zip(uniq, cnts)}
+    label_names = {k: id2label.get(int(k), str(k)) for k in counts_map.keys()}
+    log(f"[EVAL] Class counts (validation): " + str({label_names[k]: counts_map[k] for k in counts_map}), prefix="")
+
+    # Metrics (guard AUC when single-class)
+    acc = accuracy_score(y, yhat)
+    f1m = f1_score(y, yhat, average="macro")
+    if len(uniq) == 2:
+        try:
+            auc = roc_auc_score(y, p)
+        except Exception:
+            auc = float("nan")
+    else:
+        log("[EVAL] Only one class present in labels; ROC-AUC is undefined. Increase max_val or ensure stratification.", prefix="")
+        auc = float("nan")
+
     log(f"acc={acc:.4f} | f1_macro={f1m:.4f} | auroc={auc:.4f}", prefix="[BEST]")
+
+    # Error analysis: print up to 20 misclassified examples with confidence
+    mis_idx = np.where(yhat != y)[0].tolist()
+    log(f"[EVAL] Misclassified examples: {len(mis_idx)}", prefix="")
+    max_print = min(20, len(mis_idx))
+    for i in range(max_print):
+        j = mis_idx[i]
+        gold = int(y[j]); pred_lbl = int(yhat[j]); conf = float(p[j])
+        gold_name = id2label.get(gold, str(gold))
+        pred_name = id2label.get(pred_lbl, str(pred_lbl))
+        snippet = texts_all[j].replace("\n", " ")
+        if len(snippet) > 300:
+            snippet = snippet[:300]
+        log(f"[ERR] gold={gold_name} pred={pred_name} prob_ai={conf:.4f} | text={snippet}", prefix="")
 
     pred_dir = best_dir / "preds"; pred_dir.mkdir(parents=True, exist_ok=True)
     np.save(pred_dir / "val_labels.npy", y)
     np.save(pred_dir / "val_prob_ai.npy", p)
     np.save(pred_dir / "val_pred.npy", yhat)
-    json_dump({"acc": acc, "f1_macro": f1m, "auroc": auc}, pred_dir / "metrics.json")
+    json_dump({"acc": acc, "f1_macro": f1m, "auroc": auc, "class_counts": counts_map}, pred_dir / "metrics.json")
     log(f"Saved preds + metrics → {pred_dir}", prefix="[SAVE]")
 
-    # --- Also evaluate extra splits present (test / OOD) ---
-    from torch.utils.data import DataLoader
+    # Also evaluate extra splits (test / OOD) with the same guards
     extra = [k for k in ds_tok.keys() if k not in ("train", "validation")]
     for split in extra:
-        loader = DataLoader(ds_tok[split], batch_size=max(1, cfg["batch_size"]*2),
-                            shuffle=False, collate_fn=collator)
+        ds_split = ds_tok[split]
+        loader = DataLoader(ds_split, batch_size=max(1, cfg["batch_size"]*2), shuffle=False, collate_fn=collate_keep_text)
         ys, yps, yhats = [], [], []
         for batch in loader:
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             attention_mask = batch.get("attention_mask")
-            if attention_mask is not None: attention_mask = attention_mask.to(device, non_blocking=True)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(device, non_blocking=True)
             with torch.no_grad(), torch.amp.autocast('cuda', dtype=base_dtype):
                 logits = model(input_ids=input_ids, attention_mask=attention_mask).float()
             prob_ai = torch.softmax(logits, dim=-1)[:, 1]
+            if torch.isnan(prob_ai).any():
+                prob_ai = torch.nan_to_num(prob_ai, nan=0.5, posinf=1.0, neginf=0.0)
             pred = logits.argmax(-1)
             ys.append(batch["labels"].cpu()); yps.append(prob_ai.cpu()); yhats.append(pred.cpu())
         import numpy as _np, torch as _t
         y = _t.cat(ys).numpy(); p = _t.cat(yps).numpy(); yhat = _t.cat(yhats).numpy()
         from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
         acc = accuracy_score(y, yhat); f1m = f1_score(y, yhat, average="macro")
-        try: auc = roc_auc_score(y, p)
-        except Exception: auc = float("nan")
+        uniq, _ = _np.unique(y, return_counts=True)
+        if len(uniq) == 2:
+            try:
+                auc = roc_auc_score(y, p)
+            except Exception:
+                auc = float("nan")
+        else:
+            auc = float("nan")
         json_dump({"acc": acc, "f1_macro": f1m, "auroc": auc}, best_dir / "preds" / f"{split}_metrics.json")
 
 

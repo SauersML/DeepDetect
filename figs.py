@@ -717,32 +717,51 @@ def process_api_baselines() -> None:
     out_dir = PLOTS_ROOT / "api_baselines"
     ensure_dir(out_dir)
 
-    # Collect metrics
     mfiles = sorted(base_dir.glob("external_llm_metrics__*.json"))
     if not mfiles:
         return
-    names = []
-    accs = []
-    f1s = []
-    cov_used = []
-    cov_skipped = []
-    by_model_confmats = []
+
+    import math
+
+    def _to_float_or_nan(x):
+        if x is None:
+            return float("nan")
+        try:
+            return float(x)
+        except Exception:
+            return float("nan")
+
+    def _to_int_or_zero(x):
+        if x is None:
+            return 0
+        try:
+            # handle strings / floats cleanly
+            v = int(x) if (isinstance(x, (int, np.integer)) or (isinstance(x, str) and x.strip().isdigit())) else int(float(x))
+            return v
+        except Exception:
+            return 0
+
+    names: List[str] = []
+    accs: List[float] = []
+    f1s: List[float] = []
+    cov_used: List[int] = []
+    cov_skipped: List[int] = []
+    by_model_confmats: List[Optional[np.ndarray]] = []
 
     for jf in mfiles:
         data = read_json(jf) or {}
-        name = data.get("model_name") or jf.stem.replace("external_llm_metrics__", "")
-        names.append(name)
-        accs.append(data.get("accuracy", float("nan")))
-        f1s.append(data.get("f1_macro", float("nan")))
-        cov_used.append(int(data.get("n_used_for_metrics", 0)))
-        cov_skipped.append(int(data.get("n_skipped", 0)))
+        name_raw = data.get("model_name")
+        safe_name = (str(name_raw) if name_raw not in (None, "") else jf.stem.replace("external_llm_metrics__", ""))
+        names.append(safe_name)
 
-        # Confusion: try to read preds CSV and compute
-        csvp = base_dir / f"external_llm_preds__{name.replace('/','_').replace(':','_')}.csv"
+        accs.append(_to_float_or_nan(data.get("accuracy", float("nan"))))
+        f1s.append(_to_float_or_nan(data.get("f1_macro", float("nan"))))
+        cov_used.append(_to_int_or_zero(data.get("n_used_for_metrics", 0)))
+        cov_skipped.append(_to_int_or_zero(data.get("n_skipped", 0)))
+
+        # Try to load the corresponding preds CSV to build a confusion matrix (optional)
+        csvp = base_dir / f"external_llm_preds__{safe_name.replace('/','_').replace(':','_')}.csv"
         if not csvp.exists():
-            # try safe variant (the script used sanitized name)
-            candidates = list(base_dir.glob(f"external_llm_preds__*.csv"))
-            # match by model_name inside csv header if needed — fallback: skip
             by_model_confmats.append(None)
             continue
         try:
@@ -751,23 +770,32 @@ def process_api_baselines() -> None:
                 reader = csv.DictReader(cf)
                 for r in reader:
                     rows.append(r)
-            y_true = np.array([int(r["gold_int"]) for r in rows])
-            y_pred = np.array([int(r["pred_int"]) for r in rows if r["pred_int"] != ""], dtype=int)
-            # Need alignment (skipped may exist). Filter to rows with pred_int present
-            mask = np.array([r["pred_int"] != "" for r in rows], dtype=bool)
-            y_true = y_true[mask]
-            cm = confusion_matrix(y_true, y_pred, labels=[0,1])
+            # Keep rows that actually have a parsed prediction
+            mask = np.array([ (r.get("pred_int") not in (None, "", "None")) for r in rows ], dtype=bool)
+            if not mask.any():
+                by_model_confmats.append(None)
+                continue
+            y_true = np.array([int(r["gold_int"]) for r in np.array(rows, dtype=object)[mask]])
+            y_pred = np.array([int(r["pred_int"]) for r in np.array(rows, dtype=object)[mask]])
+            cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
             by_model_confmats.append(cm)
         except Exception:
             by_model_confmats.append(None)
 
-    # Accuracy/F1 bars
+    # Convert to numpy arrays for plotting; NaNs are fine for bar heights (bar won't render)
+    accs_arr = np.array(accs, dtype=float)
+    f1s_arr = np.array(f1s, dtype=float)
+    used = np.array(cov_used, dtype=float)   # float avoids dtype issues if stacked with other floats
+    skipped = np.array(cov_skipped, dtype=float)
+
+    # --- Accuracy & F1 bars ---
     idx = np.arange(len(names))
     width = 0.42
-    fig, ax = plt.subplots(figsize=(max(7.5, 0.9*len(names)+4), 4.6))
-    ax.bar(idx - width/2, accs, width, color=TAB[0], alpha=0.9, label="Accuracy")
-    ax.bar(idx + width/2, f1s, width, color=TAB[3], alpha=0.9, label="F1 (macro)")
-    ax.set_xticks(idx); ax.set_xticklabels(names, rotation=25, ha="right")
+    fig, ax = plt.subplots(figsize=(max(7.5, 0.9 * len(names) + 4), 4.6))
+    ax.bar(idx - width/2, accs_arr, width, color=TAB[0], alpha=0.9, label="Accuracy")
+    ax.bar(idx + width/2, f1s_arr,  width, color=TAB[3], alpha=0.9, label="F1 (macro)")
+    ax.set_xticks(idx)
+    ax.set_xticklabels([str(n) for n in names], rotation=25, ha="right")
     ax.set_ylim(0, 1.0)
     ax.set_ylabel("Score")
     ax.set_title("API baselines — Accuracy & F1")
@@ -775,24 +803,29 @@ def process_api_baselines() -> None:
     fig.savefig(out_dir / "api_acc_f1.png")
     show_or_close(fig, _in_notebook())
 
-    # Coverage stacked bar (used vs skipped)
-    used = np.array(cov_used, dtype=int)
-    skipped = np.array(cov_skipped, dtype=int)
-    fig2, ax2 = plt.subplots(figsize=(max(7.5, 0.9*len(names)+4), 4.3))
-    ax2.bar(names, used, color=TAB[1], label="Used")
-    ax2.bar(names, skipped, bottom=used, color=TAB[2], label="Skipped")
+    # --- Coverage stacked bar (used vs skipped) ---
+    fig2, ax2 = plt.subplots(figsize=(max(7.5, 0.9 * len(names) + 4), 4.3))
+    ax2.bar([str(n) for n in names], used,    color=TAB[1], label="Used")
+    ax2.bar([str(n) for n in names], skipped, bottom=used, color=TAB[2], label="Skipped")
     ax2.set_ylabel("# examples")
     ax2.set_title("API baselines — Coverage (used vs skipped)")
     ax2.legend(frameon=False)
     fig2.savefig(out_dir / "api_coverage.png")
     show_or_close(fig2, _in_notebook())
 
-    # Confusion matrices per model (if available)
+    # --- Confusion matrices per model (if available) ---
     for name, cm in zip(names, by_model_confmats):
         if cm is None:
             continue
-        draw_conf_matrix(cm, ["HUMAN","AI"], f"{name} — Confusion", out_dir / f"api_confusion__{name.replace('/','_').replace(':','_')}.png", normalize=False, show=_in_notebook())
-
+        try:
+            draw_conf_matrix(cm, ["HUMAN", "AI"],
+                             f"{name} — Confusion",
+                             out_dir / f"api_confusion__{str(name).replace('/','_').replace(':','_')}.png",
+                             normalize=False,
+                             show=_in_notebook())
+        except Exception:
+            # Skip quietly if anything goes wrong for a single model
+            continue
 
 # -------------------------
 # Main

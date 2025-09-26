@@ -789,19 +789,34 @@ def train_eval(cfg: Dict[str, Any]):
             self.drop = nn.Dropout(dropout)
             self.cls = nn.Linear(hidden, num_labels)
             self.num_labels = num_labels
+    
         def forward(self, input_ids=None, attention_mask=None, labels=None):
             base_model = getattr(self.backbone, "base_model", self.backbone)
-            encoder = getattr(base_model, "model", base_model)
-            out = encoder(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
-            h = out.last_hidden_state
+            encoder = getattr(base_model, "model", base_model)  # prefer bare transformer if present
+            out = encoder(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                return_dict=True,
+                output_hidden_states=True,
+    
+            if hasattr(out, "last_hidden_state") and out.last_hidden_state is not None:
+                h = out.last_hidden_state
+            elif getattr(out, "hidden_states", None) is not None:
+                h = out.hidden_states[-1]
+            else:
+                # ultra-conservative fallback (shouldn’t be hit)
+                h = self.backbone.get_input_embeddings()(input_ids)
+    
             if attention_mask is None:
                 pooled = h[:, -1]
             else:
                 mask = attention_mask.unsqueeze(-1).type_as(h)
                 pooled = (h * mask).sum(1) / mask.sum(1).clamp(min=1.0)
+    
             logits = self.cls(self.drop(pooled))
             loss = F.cross_entropy(logits, labels.long()) if labels is not None else None
             return {"loss": loss, "logits": logits}
+
 
     hidden_size = getattr(backbone.config, "hidden_size", None) or getattr(backbone.config, "hidden_dim", None)
     assert hidden_size, "Could not infer hidden size."
@@ -1183,17 +1198,31 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
             self.backbone = backbone
             self.cls = nn.Linear(hidden, num_labels)
             self.num_labels = num_labels
+    
         def forward(self, input_ids=None, attention_mask=None):
             base_model = getattr(self.backbone, "base_model", self.backbone)
             encoder = getattr(base_model, "model", base_model)
-            out = encoder(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
-            h = out.last_hidden_state
+            out = encoder(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                return_dict=True,
+                output_hidden_states=True,   # <-- key difference
+            )
+    
+            if hasattr(out, "last_hidden_state") and out.last_hidden_state is not None:
+                h = out.last_hidden_state
+            elif getattr(out, "hidden_states", None) is not None:
+                h = out.hidden_states[-1]
+            else:
+                h = self.backbone.get_input_embeddings()(input_ids)
+    
             if attention_mask is not None:
                 mask = attention_mask.unsqueeze(-1).type_as(h)
                 pooled = (h * mask).sum(1) / mask.sum(1).clamp(min=1.0)
             else:
                 pooled = h[:, -1]
             return self.cls(pooled)
+
 
     head_state = torch.load(best_dir / "classifier.pt", map_location=device)
     hidden_size = int(head_state.get("hidden_size") or getattr(backbone.config, "hidden_size", None) or getattr(backbone.config, "hidden_dim"))
@@ -1205,21 +1234,12 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
 
     # Build an eval DataLoader that preserves raw_text for error analysis
     def collate_keep_text(features):
-        """
-        Collate function that preserves the original raw text strings for analysis
-        while ensuring the HF DataCollator only sees tensor-able fields.
-        """
-        # stash the strings so the collator never touches them
+        # keep originals for error analysis
         texts = [f.get("raw_text", "") for f in features]
-    
-        # keep only fields that should be padded/stacked into tensors
+        # pass only tensor-able fields to the HF collator
         TENSOR_KEYS = {"input_ids", "attention_mask", "labels", "token_type_ids"}
         clean = [{k: v for k, v in f.items() if k in TENSOR_KEYS} for f in features]
-    
-        # let the standard collator handle padding/truncation
         batch = collator(clean)
-    
-        # put the raw strings back for downstream logging/error analysis
         batch["raw_text"] = texts
         return batch
 

@@ -21,7 +21,7 @@ DEFAULT_CFG = {
     "batch_size": 2,
     "grad_accum": 1,
     "max_grad_norm": 1.0,
-    "use_lora": True,  # QLoRA on by default
+    "use_lora": True, # QLoRA on by default
     # include MLP projections too (Gemma/Llama style names)
     "target_mods": "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
     "lora_r": 16,
@@ -31,12 +31,12 @@ DEFAULT_CFG = {
     "lr": 1e-4,
     "weight_decay": 0.0,
     "warmup_ratio": 0.06,
-    "max_train": 2000, 
+    "max_train": 2000,
     "max_val": 200,
     "wandb": False,
     "eval_every": 0,
     "eval_only": False,
-    "resume": False,
+    "warm_start": True,
 }
 
 import contextlib
@@ -606,12 +606,13 @@ def train_eval(cfg: Dict[str, Any]):
     )
 
     # Early paths
-    if cfg["eval_only"] and not best_dir.exists():
-        log("eval-only requested but no checkpoint found → exit", prefix="[EVAL]")
-        return
-    if cfg["resume"] and best_dir.exists() and not cfg["eval_only"]:
-        log("best checkpoint exists and --resume set → evaluate only", prefix="[EVAL]")
-        return evaluate_and_save(cfg, best_dir, ds_tok, val_dl, collator, id2label)
+    if cfg["eval_only"]:
+        if best_dir.exists():
+            log("eval-only requested → evaluating best checkpoint", prefix="[EVAL]")
+            return evaluate_and_save(cfg, best_dir, ds_tok, val_dl, collator, id2label)
+        else:
+            log("eval-only requested but no checkpoint found → exit", prefix="[EVAL]")
+            return
 
     # Precision & GPU info
     import torch as _t
@@ -644,11 +645,10 @@ def train_eval(cfg: Dict[str, Any]):
         log(f"Quantization: disabled (bitsandbytes {bnb_version_raw} < 0.42.0)", prefix="[MODEL]")
 
 
-    # Model load (progress printed by HF/transformers)
+    # Model load + WARM-START (weights only; fresh optimizer/schedule every run)
     t0 = time.time()
     log(f"Loading base model: {cfg['model_id']}", prefix="[MODEL]")
     base = safe_load_backbone(cfg["model_id"], base_dtype, quant)
-    
     base.config.output_hidden_states = True
     base.config.use_cache = False
     if hasattr(base, "gradient_checkpointing_enable"):
@@ -664,20 +664,57 @@ def train_eval(cfg: Dict[str, Any]):
     # ensure inputs require grads for gradient checkpointing + k-bit training
     if hasattr(base, "enable_input_require_grads"):
         base.enable_input_require_grads()
-    hidden_size = getattr(base.config, "hidden_size", None) or getattr(base.config, "hidden_dim", None)
-    assert hidden_size, "Could not infer hidden size."
-    log(f"Model loaded in {time.time()-t0:.1f}s | hidden_size={hidden_size}", prefix="[MODEL]")
 
-    # LoRA adapters
-    backbone = base
-    if cfg["use_lora"]:
-        log("Injecting LoRA adapters", prefix="[LoRA]")
-        from peft import LoraConfig, get_peft_model
-        lcfg = LoraConfig(
-            r=cfg["lora_r"], lora_alpha=cfg["lora_alpha"], lora_dropout=cfg["lora_dropout"],
-            target_modules=cfg["target_mods"].split(","), bias="none", task_type="CAUSAL_LM",
-        )
-        backbone = get_peft_model(base, lcfg)
+    warm_used = False
+    warm_notes = []
+    backbone = None
+
+    # Try warm-start from best_dir whenever possible (independent of epochs)
+    try:
+        if cfg.get("warm_start", True) and best_dir.exists():
+            if cfg["use_lora"] and (best_dir / "lora_adapter").exists():
+                log("WARM-START: loading previous LoRA adapter", prefix="[WARM]")
+                backbone = PeftModel.from_pretrained(base, str(best_dir / "lora_adapter"))
+                warm_used = True
+            elif (not cfg["use_lora"]) and (best_dir / "backbone").exists():
+                log("WARM-START: loading previous finetuned backbone", prefix="[WARM]")
+                backbone = AutoModelForCausalLM.from_pretrained(
+                    str(best_dir / "backbone"),
+                    torch_dtype=base_dtype,
+                    device_map={"": 0}
+                )
+                backbone.config.output_hidden_states = True
+                backbone.config.use_cache = False
+                # prepare for k-bit if training full model
+                backbone = prepare_model_for_kbit_training(
+                    backbone,
+                    use_gradient_checkpointing=True,
+                    gradient_checkpointing_kwargs={"use_reentrant": False},
+                )
+                warm_used = True
+            else:
+                warm_notes.append("no_compatible_artifact_in_best_dir")
+        else:
+            warm_notes.append("best_dir_missing_or_warm_start_disabled")
+    except Exception as e:
+        warm_notes.append(f"warm_start_error:{type(e).__name__}")
+
+    if backbone is None:
+        # Scratch path: inject new LoRA if configured
+        backbone = base
+        if cfg["use_lora"]:
+            log("Injecting NEW LoRA adapters (scratch)", prefix="[LoRA]")
+            from peft import LoraConfig, get_peft_model
+            lcfg = LoraConfig(
+                r=cfg["lora_r"], lora_alpha=cfg["lora_alpha"], lora_dropout=cfg["lora_dropout"],
+                target_modules=cfg["target_mods"].split(","), bias="none", task_type="CAUSAL_LM",
+            )
+            backbone = get_peft_model(base, lcfg)
+        log("WARM-START: NOT USED", prefix="[WARM]")
+    else:
+        log("WARM-START: USED", prefix="[WARM]")
+
+    if hasattr(backbone, "print_trainable_parameters"):
         backbone.print_trainable_parameters()
 
     # Lightweight classifier on pooled last hidden state
@@ -691,7 +728,6 @@ def train_eval(cfg: Dict[str, Any]):
         def forward(self, input_ids=None, attention_mask=None, labels=None):
             out = self.backbone(input_ids=input_ids, attention_mask=attention_mask,
                                 output_hidden_states=True, return_dict=True)
-
             h = out.hidden_states[-1]
             if attention_mask is None:
                 pooled = h[:, -1]
@@ -702,7 +738,32 @@ def train_eval(cfg: Dict[str, Any]):
             loss = F.cross_entropy(logits, labels.long()) if labels is not None else None
             return {"loss": loss, "logits": logits}
 
-    model = SeqClassifier(backbone, hidden_size, num_labels=2).to(device)
+    hidden_size = getattr(backbone.config, "hidden_size", None) or getattr(backbone.config, "hidden_dim", None)
+    assert hidden_size, "Could not infer hidden size."
+    model = SeqClassifier(backbone, hidden_size, num_labels=len(id2label)).to(device)
+
+    # Try to warm-start classifier head if label mapping matches
+    try:
+        if warm_used and (best_dir / "classifier.pt").exists() and (best_dir / "id2label.json").exists():
+            with open(best_dir / "id2label.json") as f:
+                prev_id2label = {int(k): v for k, v in json.load(f).items()}
+            if prev_id2label == id2label:
+                head_state = torch.load(best_dir / "classifier.pt", map_location="cpu")
+                model.cls.load_state_dict(head_state["state_dict"], strict=True)
+                log("WARM-START: loaded previous classifier head", prefix="[WARM]")
+            else:
+                warm_notes.append("label_mapping_changed→fresh_classifier_head")
+                log("WARM-START: label mapping changed → new classifier head", prefix="[WARM]")
+        elif warm_used:
+            warm_notes.append("no_classifier_head_found")
+    except Exception as e:
+        warm_notes.append(f"classifier_load_error:{type(e).__name__}")
+
+    # Persist warm-start decision for audit
+    json_dump({"used": warm_used, "notes": warm_notes, "source": str(best_dir)}, save_root / "warm_start_status.json")
+    log(f"Model ready in {time.time()-t0:.1f}s | hidden_size={hidden_size}", prefix="[MODEL]")
+    if warm_notes:
+        log("WARM-START notes: " + ", ".join(warm_notes), prefix="[WARM]")
 
     # Optim & sched
     steps_per_epoch = math.ceil(len(train_dl) / cfg["grad_accum"])

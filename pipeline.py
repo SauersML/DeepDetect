@@ -532,7 +532,10 @@ def load_and_tokenize(cfg: Dict[str, Any], save_root: Path, max_train=0, max_val
 
     # label mapping
     feat = ds["train"].features.get(label_col)
-    if isinstance(feat, ClassLabel):
+    # Special-case: MAGE uses 0=AI (machine), 1=HUMAN
+    if cfg["dataset_id"].lower() in {"yaful/mage", "mage", r"yaful\mage"}:
+        id2label = {0: "AI", 1: "HUMAN"}
+    elif isinstance(feat, ClassLabel):
         id2label = {i: n.upper() for i, n in enumerate(feat.names)}
     else:
         vals = set(ds["train"][label_col])
@@ -626,32 +629,39 @@ def train_eval(cfg: Dict[str, Any]):
 
     # Data
     ds_tok, collator, id2label = load_and_tokenize(cfg, save_root, cfg["max_train"], cfg["max_val"])
+    # Index of the AI class (used everywhere we compute prob_ai)
+    ai_idx = int([k for k, v in id2label.items() if str(v).upper() == "AI"][0])
 
     # Drop non-tensor fields (like 'raw_text') during batching for train/val
     def collate_drop_text(features):
         feats = [{k: v for k, v in f.items() if k != "raw_text"} for f in features]
         return collator(feats)
 
+    # drop the non-tensor column from the training split (prevents 'raw_text' from reaching the collator)
+    train_ds = ds_tok["train"].remove_columns([c for c in ds_tok["train"].column_names if c == "raw_text"])
     train_dl = DataLoader(
-        ds_tok["train"],
+        train_ds,
         batch_size=cfg["batch_size"],
         shuffle=True,
-        collate_fn=collate_drop_text,
+        collate_fn=collator,  # DataCollatorWithPadding
+        pin_memory=True,
+        num_workers=0,
+        persistent_workers=False,
+    )
+    
+    val_bs = max(1, cfg["batch_size"] * 2)
+    # use a copy of validation without 'raw_text' for mid-epoch evals during training
+    val_ds_for_train = ds_tok["validation"].remove_columns([c for c in ds_tok["validation"].column_names if c == "raw_text"])
+    val_dl = DataLoader(
+        val_ds_for_train,
+        batch_size=val_bs,
+        shuffle=False,
+        collate_fn=collator,  # DataCollatorWithPadding
         pin_memory=True,
         num_workers=0,
         persistent_workers=False,
     )
 
-    val_bs = max(1, cfg["batch_size"] * 2)
-    val_dl = DataLoader(
-        ds_tok["validation"],
-        batch_size=val_bs,
-        shuffle=False,
-        collate_fn=collate_drop_text,
-        pin_memory=True,
-        num_workers=0,
-        persistent_workers=False,
-    )
 
     # Early paths
     if cfg["eval_only"]:
@@ -1079,6 +1089,8 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
     assert best_dir.exists(), f"Best dir not found: {best_dir}"
     device = torch.device("cuda")
     base_dtype = torch.bfloat16 if cfg["precision"] == "bf16" else torch.float16
+    # Index of the AI class for probability computation
+    ai_idx = int([k for k, v in id2label.items() if str(v).upper() == "AI"][0])
 
     # Light quant reload
     try:

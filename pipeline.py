@@ -745,6 +745,7 @@ def train_eval(cfg: Dict[str, Any]):
         total_loss, nb = 0.0, 0
         ys, yps, yhats = [], [], []
         pbar = tqdm(loader, desc="Validating", unit="batch", leave=False)
+        import numpy as np, torch as _t
         for batch in pbar:
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             attention_mask = batch.get("attention_mask")
@@ -759,7 +760,21 @@ def train_eval(cfg: Dict[str, Any]):
             pred = logits.argmax(-1)
             total_loss += float(loss.item()); nb += 1
             ys.append(labels.cpu()); yps.append(prob_ai.cpu()); yhats.append(pred.cpu())
-            pbar.set_postfix({"loss": f"{total_loss/max(1,nb):.4f}"})
+            # live validation metrics on processed batches so far
+            try:
+                y_sofar = _t.cat(ys).numpy(); p_sofar = _t.cat(yps).numpy(); yhat_sofar = _t.cat(yhats).numpy()
+                acc_sofar = accuracy_score(y_sofar, yhat_sofar)
+                f1_sofar = f1_score(y_sofar, yhat_sofar, average="macro")
+                try: auc_sofar = roc_auc_score(y_sofar, p_sofar)
+                except Exception: auc_sofar = float("nan")
+                pbar.set_postfix({
+                    "loss": f"{total_loss/max(1,nb):.4f}",
+                    "acc": f"{acc_sofar:.3f}",
+                    "f1": f"{f1_sofar:.3f}",
+                    "auc": f"{auc_sofar:.3f}",
+                })
+            except Exception:
+                pbar.set_postfix({"loss": f"{total_loss/max(1,nb):.4f}"})
         import numpy as np, torch as _t
         y = _t.cat(ys).numpy(); p = _t.cat(yps).numpy(); yhat = _t.cat(yhats).numpy()
         acc = accuracy_score(y, yhat); f1m = f1_score(y, yhat, average="macro")
@@ -776,7 +791,9 @@ def train_eval(cfg: Dict[str, Any]):
     for epoch in range(1, cfg["epochs"] + 1):
         model.train()
         running = 0.0
+        ys_run, yps_run, yhats_run = [], [], []  # epoch-to-date for live train metrics
         batches = tqdm(train_dl, desc=f"Epoch {epoch}/{cfg['epochs']}", unit="batch")
+
         opt.zero_grad(set_to_none=True)
 
         for step, batch in enumerate(batches, start=1):
@@ -788,6 +805,13 @@ def train_eval(cfg: Dict[str, Any]):
             with torch.autocast(device_type="cuda", dtype=(torch.bfloat16 if cfg["precision"] == "bf16" else torch.float16)):
                 out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
                 loss = out["loss"] / cfg["grad_accum"]
+                logits = out["logits"].detach().float()
+                prob_ai = torch.softmax(logits, dim=-1)[:, 1]
+                pred = logits.argmax(-1)
+            # accumulate for live train metrics
+            ys_run.append(labels.detach().cpu())
+            yps_run.append(prob_ai.detach().cpu())
+            yhats_run.append(pred.detach().cpu())
 
             if cfg["precision"] == "fp16":
                 scaler.scale(loss).backward()
@@ -808,10 +832,34 @@ def train_eval(cfg: Dict[str, Any]):
             running += float(loss.item())
             if step % (cfg["grad_accum"] * 5) == 0:
                 avg = running / (cfg["grad_accum"] * 5)
-                batches.set_postfix({"train_loss": f"{avg:.4f}", "lr": f"{sch.get_last_lr()[0]:.2e}"})
+                import torch as _t, numpy as _np
+                from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
+                y_tr = _t.cat(ys_run).numpy()
+                p_tr = _t.cat(yps_run).numpy()
+                yhat_tr = _t.cat(yhats_run).numpy()
+                acc_tr = accuracy_score(y_tr, yhat_tr)
+                f1_tr = f1_score(y_tr, yhat_tr, average="macro")
+                try: auc_tr = roc_auc_score(y_tr, p_tr)
+                except Exception: auc_tr = float("nan")
+                batches.set_postfix({
+                    "train_loss": f"{avg:.4f}",
+                    "acc": f"{acc_tr:.3f}",
+                    "f1": f"{f1_tr:.3f}",
+                    "auc": f"{auc_tr:.3f}",
+                    "lr": f"{sch.get_last_lr()[0]:.2e}"
+                })
                 if cfg["wandb"]:
-                    import wandb; wandb.log({"train/loss": avg, "train/lr": sch.get_last_lr()[0]})
+                    import wandb
+                    wandb.log({
+                        "train/loss": avg,
+                        "train/lr": sch.get_last_lr()[0],
+                        "train/acc": acc_tr,
+                        "train/f1_macro": f1_tr,
+                        "train/auroc": auc_tr,
+                        "train/step": (epoch-1)*steps_per_epoch + step
+                    })
                 running = 0.0
+
 
         # Eval
         valm = evaluate(model, val_dl)

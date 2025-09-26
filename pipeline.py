@@ -581,10 +581,10 @@ def train_eval(cfg: Dict[str, Any]):
         shuffle=True,
         collate_fn=collator,
         pin_memory=True,
-        num_workers=2,
-        persistent_workers=True,
-        prefetch_factor=2,
+        num_workers=0,
+        persistent_workers=False,
     )
+
     val_bs = max(1, cfg["batch_size"] * 2)
     val_dl = DataLoader(
         ds_tok["validation"],
@@ -592,11 +592,9 @@ def train_eval(cfg: Dict[str, Any]):
         shuffle=False,
         collate_fn=collator,
         pin_memory=True,
-        num_workers=2,
-        persistent_workers=True,
-        prefetch_factor=2,
+        num_workers=0,
+        persistent_workers=False,
     )
-
 
     # Early paths
     if cfg["eval_only"] and not best_dir.exists():
@@ -944,7 +942,14 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
     model.cls.load_state_dict(head_state["state_dict"], strict=True)
     model.eval()
 
-    loader = val_dl if isinstance(val_dl, DataLoader) else DataLoader(ds_tok["validation"], batch_size=max(1, cfg["batch_size"]*2), shuffle=False, collate_fn=collator)
+    loader = val_dl if isinstance(val_dl, DataLoader) else DataLoader(
+        ds_tok["validation"],
+        batch_size=max(1, cfg["batch_size"]*2),
+        shuffle=False,
+        collate_fn=collator,
+        num_workers=0,
+        persistent_workers=False,
+    )
 
     ys, yps, yhats = [], [], []
     pbar = tqdm(loader, desc="Eval(best)", unit="batch", leave=False)

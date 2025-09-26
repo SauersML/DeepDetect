@@ -10,11 +10,8 @@ from typing import Dict, Any, List, Optional, Tuple
 
 import numpy as np
 
-# Optional dependency: pandas (used for metrics.csv handling)
-try:
-    import pandas as pd
-except Exception:
-    pd = None
+import pandas as pd
+
 
 # Matplotlib only (no seaborn)
 import matplotlib

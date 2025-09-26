@@ -34,7 +34,7 @@ DEFAULT_CFG = {
     "max_train": 2000, 
     "max_val": 200,
     "wandb": False,
-
+    "eval_every": 0,
     "eval_only": False,
     "resume": False,
 }
@@ -769,6 +769,42 @@ def train_eval(cfg: Dict[str, Any]):
     log(f"epochs={cfg['epochs']} | steps/epoch≈{steps_per_epoch} | total_steps={total_steps} | warmup={warmup_steps}", prefix="[TRAIN]")
     best_f1 = -1.0
     t0 = time.time()
+    global_step = 0
+    eval_every = int(cfg.get("eval_every", 0)) or 0  # 0 = disabled
+
+    # helper to run validation + save best
+    def _do_eval(tag: str):
+        nonlocal best_f1
+        model.eval()
+        valm = evaluate(model, val_dl)
+        elapsed = (time.time() - t0) / 60.0
+        log(
+            f"step={global_step} | {tag} | val_loss={valm['loss']:.4f} | "
+            f"acc={valm['acc']:.4f} | f1_macro={valm['f1_macro']:.4f} | auroc={valm['auroc']:.4f} | time={elapsed:.1f}m",
+            prefix="[EVAL]"
+        )
+        if cfg["wandb"]:
+            import wandb
+            wandb.log({f"val/{k}": v for k, v in valm.items()} | {"time/min": elapsed, "global_step": global_step})
+
+        # Save best by F1
+        if valm["f1_macro"] > best_f1:
+            best_f1 = valm["f1_macro"]
+            best_dir.mkdir(parents=True, exist_ok=True)
+            if cfg["use_lora"]:
+                model.backbone.save_pretrained(str(best_dir / "lora_adapter"))
+            else:
+                base.save_pretrained(str(best_dir / "backbone"))
+            torch.save(
+                {"state_dict": model.cls.state_dict(), "hidden_size": hidden_size, "num_labels": model.num_labels},
+                best_dir / "classifier.pt",
+            )
+            json_dump(id2label, best_dir / "id2label.json")
+            json_dump(cfg, best_dir / "cfg.json")
+            log(f"Saved new best → {best_dir} (f1_macro={best_f1:.4f})", prefix="[SAVE]")
+
+        torch.cuda.empty_cache(); gc.collect()
+        model.train()
 
     for epoch in range(1, cfg["epochs"] + 1):
         model.train()
@@ -812,6 +848,8 @@ def train_eval(cfg: Dict[str, Any]):
                 opt.zero_grad(set_to_none=True)
 
             running += float(loss.item())
+            global_step += 1
+
             if step % (cfg["grad_accum"] * 5) == 0:
                 avg = running / (cfg["grad_accum"] * 5)
                 import torch as _t, numpy as _np
@@ -838,40 +876,17 @@ def train_eval(cfg: Dict[str, Any]):
                         "train/acc": acc_tr,
                         "train/f1_macro": f1_tr,
                         "train/auroc": auc_tr,
-                        "train/step": (epoch-1)*steps_per_epoch + step
+                        "train/step": (epoch-1)*steps_per_epoch + step,
+                        "global_step": global_step,
                     })
                 running = 0.0
 
+            # ---- mid-epoch evaluation every N batches ----
+            if eval_every and (global_step % eval_every == 0):
+                _do_eval("mid-epoch")
 
-        # Eval
-        valm = evaluate(model, val_dl)
-        elapsed = (time.time() - t0) / 60.0
-        log(f"epoch={epoch} | val_loss={valm['loss']:.4f} | acc={valm['acc']:.4f} | f1_macro={valm['f1_macro']:.4f} | auroc={valm['auroc']:.4f} | time={elapsed:.1f}m", prefix="[EVAL]")
-        if cfg["wandb"]:
-            import wandb; wandb.log({f"val/{k}": v for k, v in valm.items()} | {"time/min": elapsed})
-
-        # Save best by F1
-        if valm["f1_macro"] > best_f1:
-            best_f1 = valm["f1_macro"]
-            best_dir.mkdir(parents=True, exist_ok=True)
-            # 1) save backbone / adapters
-            if cfg["use_lora"]:
-                # Save only the LoRA adapters (produces adapter_config.json + adapter_model.safetensors)
-                model.backbone.save_pretrained(str(best_dir / "lora_adapter"))
-            else:
-                # Not using LoRA → save the full backbone weights for eval/resume
-                base.save_pretrained(str(best_dir / "backbone"))
-            # 2) save classifier head
-            torch.save(
-                {"state_dict": model.cls.state_dict(), "hidden_size": hidden_size, "num_labels": model.num_labels},
-                best_dir / "classifier.pt",
-            )
-            # 3) metadata
-            json_dump(id2label, best_dir / "id2label.json")
-            json_dump(cfg, best_dir / "cfg.json")
-            log(f"Saved new best → {best_dir} (f1_macro={best_f1:.4f})", prefix="[SAVE]")
-
-        torch.cuda.empty_cache(); gc.collect()
+        # always eval at epoch end (covers tail that didn't hit eval_every)
+        _do_eval(f"epoch={epoch} end")
 
     log("Training complete.", prefix="[TRAIN]")
     evaluate_and_save(cfg, best_dir, ds_tok, val_dl, collator, id2label)

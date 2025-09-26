@@ -58,12 +58,12 @@ if RUN_GEMMA3:
     })
 if RUN_HERMES:
     RUNS.append({
-        "model_id": "NousResearch/Hermes-3-Llama-3.1-8B",
-        "save_dir": "./runs/Hermes-3-Llama-3.1-8B",
-        "epochs": 1,                     # shorter run
-        "batch_size": 8,                 # safer for 8B QLoRA
-        "grad_accum": 2,                 # keep effective batch size reasonable
-        "gradient_checkpointing": True   # reduce memory
+        "model_id": "NousResearch/Meta-Llama-3-8B-Instruct",
+        "save_dir": "./runs/Meta-Llama-3-8B-Instruct",
+        "epochs": 1,
+        "batch_size": 8,
+        "grad_accum": 2,
+        "gradient_checkpointing": True
     })
 
 
@@ -486,6 +486,8 @@ def safe_load_backbone(
     # Allow remote code for Hermes explicitly; otherwise respect the argument.
     hermes_remote = ("hermes" in model_id.lower())
     is_gemma3 = ("gemma-3" in model_id.lower())
+    is_llama3 = ("llama-3" in model_id.lower())
+    is_hermes = ("hermes" in model_id.lower())
 
     cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=(trust_remote_code or hermes_remote))
     if hasattr(cfg, "auto_map"):
@@ -497,8 +499,12 @@ def safe_load_backbone(
         chosen_attn = "eager" if is_gemma3 else "sdpa"
     log(f"attn_implementation={chosen_attn}", prefix="[MODEL]")
 
-    # Conditionally suppress PEFT autoload for Gemma 3 only.
-    if is_gemma3:
+    # Suppress PEFT autoload for:
+    #  - Gemma 3 full-weight repos
+    #  - LLaMA-3 full-weight repos from Nous (non-Hermes)
+    should_disable_peft = is_gemma3 or (is_llama3 and not is_hermes)
+
+    if should_disable_peft:
         with _disable_peft_autoload():
             model = AutoModelForCausalLM.from_pretrained(
                 model_id,

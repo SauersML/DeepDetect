@@ -81,9 +81,6 @@ def _disable_peft_autoload():
             mu.is_peft_available = _saved_modeling
 
 
-# ---------------------------
-# [A] SUPER-VERBOSE LOGGING
-# ---------------------------
 def log(msg: str = "", *, prefix: str = "", end: str = "\n"):
     if prefix:
         print(f"{prefix} {msg}", flush=True, end=end)
@@ -96,9 +93,6 @@ def hline(txt=""):
         log(txt)
         log("=" * 80)
 
-# ---------------------------
-# [B] PIP BOOTSTRAP (LOUD)
-# ---------------------------
 def ensure_pip():
     try:
         import pip  # noqa
@@ -237,9 +231,6 @@ def ensure_core_packages():
         from transformers.utils.quantization_config import BitsAndBytesConfig  # noqa: F401
     p("BitsAndBytesConfig import OK")
 
-# ---------------------------
-# [C] ENV & CACHE
-# ---------------------------
 def setup_env_and_caches():
     from shutil import disk_usage
 
@@ -286,9 +277,6 @@ def disable_hf_transfer():
     except Exception:
         log("Fast transfer disabled via env.", prefix="[HF]")
 
-# ---------------------------
-# [E] GPU PROBE
-# ---------------------------
 def gpu_probe(preferred=None):
     import torch, subprocess
     assert torch.cuda.is_available(), "CUDA GPU not visible (check --gres=gpu and partition)."
@@ -315,18 +303,12 @@ def gpu_probe(preferred=None):
         pass
     return dtype
 
-# ---------------------------
-# [F] SEED
-# ---------------------------
 def set_seed(seed=5541):
     import torch, numpy as np, random as pyrand
     pyrand.seed(seed); np.random.seed(seed)
     torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.benchmark = True
 
-# ---------------------------
-# [G] DATA (LOUD)
-# ---------------------------
 def json_dump(obj, path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f: json.dump(obj, f, indent=2)
@@ -428,9 +410,6 @@ def safe_load_tokenizer(model_id: str):
     _log("tokenizer ready")
     return tok
 
-# ---------------------------
-# [H0] Backbone loader using AutoModelForCausalLM
-# ---------------------------
 from transformers import AutoConfig, AutoModelForCausalLM
 
 def safe_load_backbone(model_id: str, base_dtype, quant, *, device_map=None, trust_remote_code: bool = False):
@@ -577,9 +556,6 @@ def load_and_tokenize(cfg: Dict[str, Any], save_root: Path, max_train=0, max_val
     log(f"Dataset ready in {time.time()-t0:.1f}s", prefix="[DATA]")
     return ds_tok, collator, id2label
 
-# ---------------------------
-# [H] TRAIN / EVAL
-# ---------------------------
 def train_eval(cfg: Dict[str, Any]):
     import torch, time
     import torch.nn as nn, torch.nn.functional as F
@@ -846,9 +822,6 @@ def train_eval(cfg: Dict[str, Any]):
     log("Training complete.", prefix="[TRAIN]")
     evaluate_and_save(cfg, best_dir, ds_tok, val_dl, collator, id2label)
 
-# ---------------------------
-# [I] EVAL BEST
-# ---------------------------
 def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
     import torch, numpy as np
     from torch.utils.data import DataLoader
@@ -977,9 +950,6 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
         json_dump({"acc": acc, "f1_macro": f1m, "auroc": auc}, best_dir / "preds" / f"{split}_metrics.json")
 
 
-# ---------------------------
-# [J] LOGIN (OPTIONAL)
-# ---------------------------
 def maybe_login(do_login: bool):
     if not do_login: return
     token = os.environ.get("HUGGINGFACE_TOKEN") or os.environ.get("HF_TOKEN")
@@ -993,9 +963,6 @@ def maybe_login(do_login: bool):
     except Exception as e:
         log(f"HF login failed: {e}", prefix="[HF]")
 
-# ---------------------------
-# [K] MAIN
-# ---------------------------
 def main():
     # 1) Very first: bootstrap deps, env, caches
     ensure_core_packages()

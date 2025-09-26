@@ -1055,7 +1055,7 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
         from transformers import BitsAndBytesConfig
     except Exception:
         from transformers.utils.quantization_config import BitsAndBytesConfig
-    from peft import PeftModel
+    from peft import PeftModel, prepare_model_for_kbit_training
     from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 
     assert best_dir.exists(), f"Best dir not found: {best_dir}"

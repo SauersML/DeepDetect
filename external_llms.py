@@ -109,99 +109,54 @@ def _label_to_int(v: Any) -> int:
     raise ValueError(f"Unrecognized label value: {v}")
 
 def load_validation_texts(n_eval: int, seed: int) -> Tuple[List[str], List[int], Dict[int, str]]:
-    import itertools
-
     rng = random.Random(seed)
 
-    # Pick first available split in a stable order
-    split = None
-    for cand in ("validation", "val", "test", "train"):
-        try:
-            ds_stream = load_dataset(DATASET_ID, split=cand, streaming=True)
-            split = cand
+    # 1) Non-streaming load (MAGE hosts Arrow files; streaming can fail per-split)
+    ds_all = load_dataset(DATASET_ID)
+
+    # 2) Choose an existing split (prefer validation → test → val → train)
+    for cand in ("validation", "test", "val", "train"):
+        if cand in ds_all:
+            ds = ds_all[cand]
             break
-        except Exception:
-            continue
-    if split is None:
-        raise RuntimeError(f"Could not load any split for {DATASET_ID}")
+    else:
+        raise RuntimeError(f"No splits found in {DATASET_ID}")
 
-    it = iter(ds_stream)
-    first = next(it)  # peek to infer columns
-    # Re-chain the first example back in
-    it = itertools.chain([first], it)
+    # 3) Column detection
+    cols = ds.column_names
+    text_col  = next((c for c in CAND_TEXT  if c in cols), cols[0])
+    label_col = "label" if "label" in cols else next((c for c in CAND_LABEL if c in cols), None)
+    if label_col is None:
+        raise RuntimeError(f"Could not infer label column from {cols}")
 
-    # Infer columns from the first example's keys
-    keys = set(first.keys())
-    text_col = next((c for c in CAND_TEXT if c in keys), next(iter(keys)))
-    # Try to find a label-like column; fall back to heuristic later
-    label_col = next((c for c in CAND_LABEL if c in keys), None)
-
-    def _label_to_int_stream(v: Any) -> Optional[int]:
+    # 4) Normalize labels to: 0 = HUMAN, 1 = AI (MAGE is 0=AI,1=HUMAN → invert)
+    def norm_label(v: Any) -> int:
         s = str(v).strip().lower()
-        if s in {"0", "human", "real"}: return 0
-        if s in {"1", "ai", "gpt", "machine"}: return 1
-        return None  # skip unrecognized
+        if DATASET_ID.lower() == "yaful/mage":
+            try:
+                return 0 if int(v) == 1 else 1
+            except Exception:
+                if s in {"human", "real"}: return 0
+                if s in {"ai", "gpt", "machine"}: return 1
+        else:
+            if s in {"0", "human", "real"}: return 0
+            if s in {"1", "ai", "gpt", "machine"}: return 1
+        raise ValueError(f"Unrecognized label value: {v}")
 
+    # 5) Build a roughly balanced sample
+    idxs = list(range(len(ds))); rng.shuffle(idxs)
+    target_pos, target_neg = max(1, n_eval // 2), n_eval - max(1, n_eval // 2)
     pos, neg = [], []
-    target_pos = max(1, n_eval // 2)
-    target_neg = n_eval - target_pos
-
-    for ex in it:
-        try:
-            t = str(ex[text_col])
-        except KeyError:
-            continue  # skip malformed rows
-
-        y_raw = ex.get(label_col) if label_col in (None, ) else ex[label_col]
-        y = _label_to_int_stream(y_raw)
-        if y is None:
-            # If we couldn't find a label_col, try the heuristic across all fields
-            if label_col is None:
-                y = next(
-                    (yy for yy in (_label_to_int_stream(ex.get(k)) for k in keys) if yy is not None),
-                    None
-                )
-        if y is None:
-            continue  # still undecidable; skip
-
-        # Trim long texts
-        if len(t) > MAX_TEXT_CHARS:
-            t = t[:MAX_TEXT_CHARS] + " …"
-
-        if y == 1 and len(pos) < target_pos:
-            pos.append((t, y))
-        elif y == 0 and len(neg) < target_neg:
-            neg.append((t, y))
-
+    for i in idxs:
+        t = str(ds[text_col][i])
+        if len(t) > MAX_TEXT_CHARS: t = t[:MAX_TEXT_CHARS] + " …"
+        y = norm_label(ds[label_col][i])
+        (pos if y == 1 else neg).append((t, y))
         if len(pos) >= target_pos and len(neg) >= target_neg:
             break
 
-    # If one side is short, top up with whatever we have
-    pooled = pos + neg
-    if len(pooled) < n_eval:
-        # Fill the remainder from the stream regardless of class
-        for ex in it:
-            try:
-                t = str(ex[text_col])
-            except KeyError:
-                continue
-            y_candidates = [
-                _label_to_int_stream(ex.get(k)) for k in ([label_col] if label_col else keys)
-            ]
-            y = next((yy for yy in y_candidates if yy is not None), None)
-            if y is None:
-                continue
-            if len(t) > MAX_TEXT_CHARS:
-                t = t[:MAX_TEXT_CHARS] + " …"
-            pooled.append((t, y))
-            if len(pooled) >= n_eval:
-                break
-
-    if not pooled:
-        raise RuntimeError("No usable examples found in the dataset stream.")
-
-    rng.shuffle(pooled)
-    pooled = pooled[:n_eval]
+    pooled = (pos[:target_pos] + neg[:target_neg]) or (pos + neg)[:n_eval]
+    rng.shuffle(pooled); pooled = pooled[:n_eval]
 
     texts  = [t for t, _ in pooled]
     labels = [y for _, y in pooled]

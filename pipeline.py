@@ -485,6 +485,8 @@ def safe_load_backbone(
 
     # Allow remote code for Hermes explicitly; otherwise respect the argument.
     hermes_remote = ("hermes" in model_id.lower())
+    is_gemma3 = ("gemma-3" in model_id.lower())
+
     cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=(trust_remote_code or hermes_remote))
     if hasattr(cfg, "auto_map"):
         cfg.auto_map = None
@@ -492,19 +494,31 @@ def safe_load_backbone(
     if attn_impl:
         chosen_attn = attn_impl
     else:
-        chosen_attn = "eager" if "gemma-3" in model_id.lower() else "sdpa"
+        chosen_attn = "eager" if is_gemma3 else "sdpa"
     log(f"attn_implementation={chosen_attn}", prefix="[MODEL]")
 
-    # Load backbone directly (do not suppress PEFT autoload here).
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        config=cfg,
-        quantization_config=quant,
-        torch_dtype=(None if quant else base_dtype),
-        device_map=device_map,
-        trust_remote_code=(trust_remote_code or hermes_remote),
-        attn_implementation=chosen_attn,
-    )
+    # Conditionally suppress PEFT autoload for Gemma 3 only.
+    if is_gemma3:
+        with _disable_peft_autoload():
+            model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                config=cfg,
+                quantization_config=quant,
+                torch_dtype=(None if quant else base_dtype),
+                device_map=device_map,
+                trust_remote_code=(trust_remote_code or hermes_remote),
+                attn_implementation=chosen_attn,
+            )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            config=cfg,
+            quantization_config=quant,
+            torch_dtype=(None if quant else base_dtype),
+            device_map=device_map,
+            trust_remote_code=(trust_remote_code or hermes_remote),
+            attn_implementation=chosen_attn,
+        )
 
     # training-time prefs
     model.config.output_hidden_states = False

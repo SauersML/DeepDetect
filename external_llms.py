@@ -26,7 +26,7 @@ DATASET_ID     = "yaful/MAGE"
 TRAIN_MODEL_ID = "google/gemma-3-1b-pt"   # tokenizer fallback if needed
 MAX_LENGTH     = 256
 
-N_EVAL         = 5     # trials/examples
+N_EVAL         = 150     # trials/examples
 SEED           = 42
 MAX_TEXT_CHARS = 6000
 

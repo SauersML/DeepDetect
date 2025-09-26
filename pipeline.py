@@ -44,7 +44,7 @@ DEFAULT_CFG = {
 }
 
 # ---- Global run toggles ----
-RUN_GEMMA3 = True
+RUN_GEMMA3 = False
 RUN_HERMES = True
 
 RUNS = []

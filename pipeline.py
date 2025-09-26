@@ -450,6 +450,17 @@ def safe_load_backbone(model_id: str, base_dtype, quant, *, device_map=None, tru
     if hasattr(cfg, "auto_map"):
         cfg.auto_map = None
 
+    # Prefer 'eager' attention on pre-Ampere (SM < 80) to avoid fp16 instability; log the choice.
+    attn_impl = "sdpa"
+    try:
+        import torch as _t
+        maj, _ = _t.cuda.get_device_capability(0)
+        if maj < 8:
+            attn_impl = "eager"
+    except Exception:
+        pass
+    log(f"attn_implementation={attn_impl}", prefix="[MODEL]")
+
     # >>> disable PEFT autoload only for this call <<<
     with _disable_peft_autoload():
         model = AutoModelForCausalLM.from_pretrained(
@@ -459,8 +470,7 @@ def safe_load_backbone(model_id: str, base_dtype, quant, *, device_map=None, tru
             torch_dtype=(None if quant else base_dtype),
             device_map=device_map,
             trust_remote_code=trust_remote_code,
-            # Gemma-3 prefers eager attention for training
-            attn_implementation="sdpa",
+            attn_implementation=attn_impl,
         )
 
     # training-time prefs
@@ -607,6 +617,8 @@ def train_eval(cfg: Dict[str, Any]):
         from transformers.utils.quantization_config import BitsAndBytesConfig
     from peft import LoraConfig, get_peft_model, PeftModel
     import bitsandbytes as bnb
+    run_id = cfg.get("run_id") or time.strftime("%Y%m%d-%H%M%S")
+    cfg["run_id"] = run_id
 
     device = torch.device("cuda")
     save_root = Path(cfg["save_dir"]); save_root.mkdir(parents=True, exist_ok=True)
@@ -1076,6 +1088,8 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
         base.config.output_hidden_states = True
         base.config.use_cache = False
         backbone = PeftModel.from_pretrained(base, str(best_dir / "lora_adapter"))
+        # Keep numerically sensitive ops (e.g., LayerNorm) in fp32 for k-bit eval
+        backbone = prepare_model_for_kbit_training(backbone, use_gradient_checkpointing=False)
     else:
         backbone_dir = best_dir / "backbone"
         if backbone_dir.exists():
@@ -1089,6 +1103,27 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
             backbone = safe_load_backbone(cfg["model_id"], base_dtype, quant)
         backbone.config.output_hidden_states = True
         backbone.config.use_cache = False
+        # Same stabilization even without LoRA
+        backbone = prepare_model_for_kbit_training(backbone, use_gradient_checkpointing=False)
+
+    # Debug: attention implementation + sample LayerNorm parameter dtypes
+    try:
+        attn_impl_dbg = getattr(backbone.config, "attn_implementation", getattr(backbone.config, "_attn_implementation", "unknown"))
+    except Exception:
+        attn_impl_dbg = "unknown"
+    log(f"[EVAL] compute_dtype={base_dtype} | attn_impl={attn_impl_dbg}", prefix="")
+    try:
+        ln_dtypes = []
+        for name, mod in backbone.named_modules():
+            if "norm" in name.lower():
+                for p in mod.parameters(recurse=False):
+                    ln_dtypes.append(str(p.dtype)); break
+            if len(ln_dtypes) >= 2:
+                break
+        if ln_dtypes:
+            log(f"[EVAL] sample LayerNorm dtypes: {ln_dtypes}", prefix="")
+    except Exception:
+        pass
 
     import torch.nn as nn
     class SeqClassifier(nn.Module):
@@ -1148,13 +1183,25 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
         labels = batch["labels"].to(device, non_blocking=True)
         raw_text = batch.get("raw_text", [])
         from torch.amp import autocast
-        with torch.no_grad(), autocast('cuda', dtype=base_dtype):
+        # Disable autocast for fp16 (pre-Ampere) to avoid instability; keep it on for bf16.
+        with torch.no_grad(), autocast('cuda', dtype=base_dtype, enabled=(cfg["precision"] == "bf16")):
             logits = model(input_ids=input_ids, attention_mask=attention_mask).float()
+
+        # Debug & sanitize logits
+        if not torch.isfinite(logits).all():
+            n_nan = int(torch.isnan(logits).sum().item())
+            n_pos = int(torch.isposinf(logits).sum().item())
+            n_neg = int(torch.isneginf(logits).sum().item())
+            log(f"[EVAL] Detected invalid logits → nan={n_nan}, +inf={n_pos}, -inf={n_neg}", prefix="")
+            logits = torch.nan_to_num(logits, nan=0.0, posinf=30.0, neginf=-30.0)
+
         prob_ai = torch.softmax(logits, dim=-1)[:, 1]
-        if torch.isnan(prob_ai).any():
-            n_nans = int(torch.isnan(prob_ai).sum().item())
-            log(f"[EVAL] Detected {n_nans} NaN probabilities → replacing NaN with 0.5", prefix="")
+        if not torch.isfinite(prob_ai).all():
+            n_bad = int((~torch.isfinite(prob_ai)).sum().item())
+            log(f"[EVAL] Detected {n_bad} non-finite probabilities → fixing with nan_to_num+clamp", prefix="")
             prob_ai = torch.nan_to_num(prob_ai, nan=0.5, posinf=1.0, neginf=0.0)
+        prob_ai = prob_ai.clamp(0.0, 1.0)
+
         pred = logits.argmax(-1)
         ys.append(labels.cpu()); yps.append(prob_ai.cpu()); yhats.append(pred.cpu()); texts_all.extend(raw_text)
 
@@ -1225,13 +1272,17 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
             attention_mask = batch.get("attention_mask")
             if attention_mask is not None:
                 attention_mask = attention_mask.to(device, non_blocking=True)
-            with torch.no_grad(), torch.amp.autocast('cuda', dtype=base_dtype):
+            with torch.no_grad(), torch.amp.autocast('cuda', dtype=base_dtype, enabled=(cfg["precision"] == "bf16")):
                 logits = model(input_ids=input_ids, attention_mask=attention_mask).float()
+            if not torch.isfinite(logits).all():
+                logits = torch.nan_to_num(logits, nan=0.0, posinf=30.0, neginf=-30.0)
             prob_ai = torch.softmax(logits, dim=-1)[:, 1]
-            if torch.isnan(prob_ai).any():
+            if not torch.isfinite(prob_ai).all():
                 prob_ai = torch.nan_to_num(prob_ai, nan=0.5, posinf=1.0, neginf=0.0)
+            prob_ai = prob_ai.clamp(0.0, 1.0)
             pred = logits.argmax(-1)
             ys.append(batch["labels"].cpu()); yps.append(prob_ai.cpu()); yhats.append(pred.cpu())
+
         import numpy as _np, torch as _t
         y = _t.cat(ys).numpy(); p = _t.cat(yps).numpy(); yhat = _t.cat(yhats).numpy()
         from sklearn.metrics import accuracy_score, f1_score, roc_auc_score

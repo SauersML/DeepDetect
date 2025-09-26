@@ -480,10 +480,17 @@ def safe_load_backbone(
     attn_impl: Optional[str] = None,
     gradient_checkpointing: bool = False,
 ):
+    """
+    Load a CausalLM backbone safely. If HF/Transformers trips the
+    'object has no attribute endswith' bug while resolving remote
+    checkpoint files, we fall back to:
+      1) snapshot_download() of the repo, then
+      2) local from_pretrained(local_path, local_files_only=True)
+    This guarantees checkpoint file paths are real strings.
+    """
     if device_map is None:
         device_map = {"": 0}
 
-    # Allow remote code for Hermes explicitly; otherwise respect the argument.
     hermes_remote = ("hermes" in model_id.lower())
     is_gemma3 = ("gemma-3" in model_id.lower())
     is_llama3 = ("llama-3" in model_id.lower())
@@ -493,38 +500,61 @@ def safe_load_backbone(
     if hasattr(cfg, "auto_map"):
         cfg.auto_map = None
 
-    if attn_impl:
-        chosen_attn = attn_impl
-    else:
-        chosen_attn = "eager" if is_gemma3 else "sdpa"
+    chosen_attn = attn_impl or ("eager" if is_gemma3 else "sdpa")
     log(f"attn_implementation={chosen_attn}", prefix="[MODEL]")
 
-    # Suppress PEFT autoload for:
-    #  - Gemma 3 full-weight repos
-    #  - LLaMA-3 full-weight repos from Nous (non-Hermes)
     should_disable_peft = is_gemma3 or (is_llama3 and not is_hermes)
 
-    if should_disable_peft:
-        with _disable_peft_autoload():
-            model = AutoModelForCausalLM.from_pretrained(
-                model_id,
-                config=cfg,
-                quantization_config=quant,
-                torch_dtype=(None if quant else base_dtype),
-                device_map=device_map,
-                trust_remote_code=(trust_remote_code or hermes_remote),
-                attn_implementation=chosen_attn,
-            )
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id,
+    def _load_from(src: str, local_only: bool = False):
+        return AutoModelForCausalLM.from_pretrained(
+            src,
             config=cfg,
             quantization_config=quant,
             torch_dtype=(None if quant else base_dtype),
             device_map=device_map,
             trust_remote_code=(trust_remote_code or hermes_remote),
             attn_implementation=chosen_attn,
+            local_files_only=local_only,
         )
+
+    try:
+        # Primary path: normal remote load
+        if should_disable_peft:
+            with _disable_peft_autoload():
+                model = _load_from(model_id, local_only=False)
+        else:
+            model = _load_from(model_id, local_only=False)
+
+    except AttributeError as e:
+        # Work around: download snapshot and load locally
+        msg = str(e)
+        if "endswith" not in msg:
+            raise  # unrelated error; surface it
+
+        log("Hit 'endswith' checkpoint bug → retrying via snapshot_download()", prefix="[MODEL]")
+        from huggingface_hub import snapshot_download
+        import os
+        # Download weights + config (covers both .safetensors and .bin)
+        allow = [
+            "config.json",
+            "generation_config.json",
+            "*.safetensors",
+            "*.safetensors.index.json",
+            "pytorch_model.bin",
+            "pytorch_model.bin.index.json",
+        ]
+        snap_dir = snapshot_download(
+            repo_id=model_id,
+            allow_patterns=allow,
+            cache_dir=os.environ.get("HF_HUB_CACHE"),  # respect env if set
+        )
+
+        # Retry load strictly from local snapshot
+        if should_disable_peft:
+            with _disable_peft_autoload():
+                model = _load_from(str(snap_dir), local_only=True)
+        else:
+            model = _load_from(str(snap_dir), local_only=True)
 
     # training-time prefs
     model.config.output_hidden_states = False

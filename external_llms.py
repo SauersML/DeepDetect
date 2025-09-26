@@ -16,9 +16,6 @@ from sklearn.metrics import (
     accuracy_score, f1_score, confusion_matrix, classification_report, roc_auc_score
 )
 
-# -------------------------------
-# GLOBAL CONFIG (hard-coded)
-# -------------------------------
 HYPERBOLIC_API_KEY = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzYXVlcnNsYWJzQGdtYWlsLmNvbSIsImlhdCI6MTc1ODg1MTM4OH0.UIIxFK6JiR01VWm3u5WPu3toSdXYnqrWYKlqHHoxKk4"
 
 BASE_URL_CHAT = "https://api.hyperbolic.xyz/v1/chat/completions"
@@ -29,13 +26,16 @@ DATASET_ID     = "yaful/MAGE"
 TRAIN_MODEL_ID = "google/gemma-3-1b-pt"   # tokenizer fallback if needed
 MAX_LENGTH     = 256
 
-N_EVAL         = 5     # EXACTLY 5 trials/examples
+N_EVAL         = 5     # trials/examples
 SEED           = 42
 MAX_TEXT_CHARS = 6000
 
 # Concurrency + timeouts
 MAX_CONCURRENT = 5  # up to 5 in-flight calls
 HTTP_TIMEOUT   = 120  # seconds
+
+ENABLE_KIMI = True
+ENABLE_L405B_BASE = False
 
 # Model specs (copy user's temp/top_p; raise max_tokens to 12k)
 MODELS: List[Dict[str, Any]] = [
@@ -54,6 +54,12 @@ MODELS: List[Dict[str, Any]] = [
         "max_tokens": 12000
     },
 ]
+
+# Apply toggles
+if not ENABLE_KIMI:
+    MODELS = [m for m in MODELS if m["name"] != "moonshotai/Kimi-K2-Instruct"]
+if not ENABLE_L405B_BASE:
+    MODELS = [m for m in MODELS if m["name"] != "meta-llama/Meta-Llama-3.1-405B"]
 
 HEADERS = {
     "Content-Type": "application/json",

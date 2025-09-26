@@ -437,7 +437,9 @@ def safe_load_backbone(model_id: str, base_dtype, quant, *, device_map=None, tru
     model.config.output_hidden_states = True
     model.config.use_cache = False
     if hasattr(model, "gradient_checkpointing_enable"):
-        model.gradient_checkpointing_enable()
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
     return model
 
 def load_and_tokenize(cfg: Dict[str, Any], save_root: Path, max_train=0, max_val=0):
@@ -643,9 +645,15 @@ def train_eval(cfg: Dict[str, Any]):
     base.config.output_hidden_states = True
     base.config.use_cache = False
     if hasattr(base, "gradient_checkpointing_enable"):
-        base.gradient_checkpointing_enable()
+        base.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
     from peft import prepare_model_for_kbit_training
-    base = prepare_model_for_kbit_training(base)
+    base = prepare_model_for_kbit_training(
+        base,
+        use_gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+    )
     # ensure inputs require grads for gradient checkpointing + k-bit training
     if hasattr(base, "enable_input_require_grads"):
         base.enable_input_require_grads()

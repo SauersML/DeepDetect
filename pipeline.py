@@ -43,6 +43,24 @@ DEFAULT_CFG = {
     "warm_start": True,
 }
 
+RUNS = [
+    {
+        "model_id": "google/gemma-3-1b-pt",
+        "save_dir": "./runs/gemma-3-1b-pt",
+        "epochs": 1,
+        "batch_size": 16,
+        "gradient_checkpointing": False
+    },
+    {
+        "model_id": "meta-llama/Meta-Llama-3-8B-Instruct",
+        "save_dir": "./runs/llama-3-8b-instruct",
+        "epochs": 1,                     # shorter run
+        "batch_size": 8,                 # safer for 8B QLoRA
+        "grad_accum": 2,                 # keep effective batch size reasonable
+        "gradient_checkpointing": True   # reduce memory
+    }
+]
+
 import contextlib
 
 @contextlib.contextmanager
@@ -1471,23 +1489,26 @@ def main():
     # 2) GPU probe + precision
     precision = gpu_probe()
 
-    # 3) Config
-    cfg = {"project": "deepfake-detect-gemma3", "precision": precision, **DEFAULT_CFG}
-    cfg["run_id"] = cfg.get("run_id") or time.strftime("%Y%m%d-%H%M%S")
-    hline("[CFG]")
-    log(json.dumps(cfg, indent=2))
+    # 3) Multi-run: Gemma first, then LLaMA-3-8B-Instruct
+    run_list = RUNS if "RUNS" in globals() else [DEFAULT_CFG]
+    for i, overrides in enumerate(run_list, start=1):
+        cfg = {"project": "deepfake-detect", "precision": precision, **DEFAULT_CFG, **overrides}
+        cfg["run_id"] = cfg.get("run_id") or time.strftime("%Y%m%d-%H%M%S")
 
-    # 5) Seed
-    set_seed(cfg["seed"])
+        hline(f"[CFG] Run {i} → {cfg['model_id']}")
+        log(json.dumps(cfg, indent=2))
 
-    # 6) Train/Eval
-    try:
-        train_eval(cfg)
-    except AssertionError as e:
-        log(f"Assertion error: {e}", prefix="[ERR]")
-    except Exception as e:
-        log(f"Unhandled exception: {e}", prefix="[ERR]")
-        raise
+        # Seed per run (keeps comparability, still deterministic)
+        set_seed(cfg["seed"])
+
+        # Train/Eval this run
+        try:
+            train_eval(cfg)
+        except AssertionError as e:
+            log(f"Assertion error: {e}", prefix="[ERR]")
+        except Exception as e:
+            log(f"Unhandled exception: {e}", prefix="[ERR]")
+            raise
 
 if __name__ == "__main__":
     main()

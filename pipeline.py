@@ -1461,11 +1461,19 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
         acc_thr = accuracy_score(y, yhat_thr)
         f1_thr = f1_score(y, yhat_thr, average="macro")
 
-        # Save both flavors
+        # Save preds + both metric flavors for this split
         out_dir = best_dir / "preds"
         json_dump({"acc": acc, "f1_macro": f1m, "auroc": auc}, out_dir / f"{split}_metrics.json")
         json_dump({"threshold": float(thr), "acc": float(acc_thr), "f1_macro": float(f1_thr)}, out_dir / f"{split}_metrics_thresh.json")
+        np.save(out_dir / f"{split}_labels.npy", y)
+        np.save(out_dir / f"{split}_prob_class1.npy", p)        # p is P(class==1)
+        np.save(out_dir / f"{split}_pred_argmax.npy", yhat)
+        np.save(out_dir / f"{split}_pred_thresh.npy", yhat_thr)
 
+        # Console summary (explicit for TEST)
+        split_upper = split.upper()
+        log(f"[{split_upper}/ARGMAX] acc={acc:.4f} | f1_macro={f1m:.4f} | auroc={auc:.4f}", prefix="[BEST]")
+        log(f"[{split_upper}/THRESH] t={float(thr):.2f} | acc={acc_thr:.4f} | f1_macro={f1_thr:.4f}", prefix="[BEST]")
 
 def maybe_login(do_login: bool):
     if not do_login: return

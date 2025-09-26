@@ -14,7 +14,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 # requiring external argument parsing or environment mutation.
 DEFAULT_CFG = {
     "model_id": "google/gemma-3-1b-pt",
-    "dataset_id": "imdb",
+    "dataset_id": "yaful/MAGE",
     "save_dir": "./runs",
     "seed": 42,
     "max_length": 256,
@@ -35,8 +35,8 @@ DEFAULT_CFG = {
     "lr": 1e-4,
     "weight_decay": 0.0,
     "warmup_ratio": 0.06,
-    "max_train": 20, 
-    "max_val": 20,
+    "max_train": 2000, 
+    "max_val": 200,
     "wandb": False,
 
     "eval_only": False,
@@ -955,6 +955,31 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
     np.save(pred_dir / "val_pred.npy", yhat)
     json_dump({"acc": acc, "f1_macro": f1m, "auroc": auc}, pred_dir / "metrics.json")
     log(f"Saved preds + metrics → {pred_dir}", prefix="[SAVE]")
+
+    # --- Also evaluate extra splits present (test / OOD) ---
+    from torch.utils.data import DataLoader
+    extra = [k for k in ds_tok.keys() if k not in ("train", "validation")]
+    for split in extra:
+        loader = DataLoader(ds_tok[split], batch_size=max(1, cfg["batch_size"]*2),
+                            shuffle=False, collate_fn=collator)
+        ys, yps, yhats = [], [], []
+        for batch in loader:
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            attention_mask = batch.get("attention_mask")
+            if attention_mask is not None: attention_mask = attention_mask.to(device, non_blocking=True)
+            with torch.no_grad(), torch.amp.autocast('cuda', dtype=base_dtype):
+                logits = model(input_ids=input_ids, attention_mask=attention_mask).float()
+            prob_ai = torch.softmax(logits, dim=-1)[:, 1]
+            pred = logits.argmax(-1)
+            ys.append(batch["labels"].cpu()); yps.append(prob_ai.cpu()); yhats.append(pred.cpu())
+        import numpy as _np, torch as _t
+        y = _t.cat(ys).numpy(); p = _t.cat(yps).numpy(); yhat = _t.cat(yhats).numpy()
+        from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
+        acc = accuracy_score(y, yhat); f1m = f1_score(y, yhat, average="macro")
+        try: auc = roc_auc_score(y, p)
+        except Exception: auc = float("nan")
+        json_dump({"acc": acc, "f1_macro": f1m, "auroc": auc}, best_dir / "preds" / f"{split}_metrics.json")
+
 
 # ---------------------------
 # [J] LOGIN (OPTIONAL)

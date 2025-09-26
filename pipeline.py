@@ -22,7 +22,7 @@ DEFAULT_CFG = {
     "grad_accum": 1,
     "gradient_checkpointing": False,
     "attn_impl": None,
-    "torch_compile": True,
+    "torch_compile": False,
     "log_interval": 50,
     "max_grad_norm": 1.0,
     "use_lora": True, # QLoRA on by default

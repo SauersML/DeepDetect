@@ -52,8 +52,8 @@ RUNS = [
         "gradient_checkpointing": False
     },
     {
-        "model_id": "meta-llama/Meta-Llama-3-8B-Instruct",
-        "save_dir": "./runs/llama-3-8b-instruct",
+        "model_id": "NousResearch/Hermes-3-Llama-3.1-8B",
+        "save_dir": "./runs/Hermes-3-Llama-3.1-8B",
         "epochs": 1,                     # shorter run
         "batch_size": 8,                 # safer for 8B QLoRA
         "grad_accum": 2,                 # keep effective batch size reasonable

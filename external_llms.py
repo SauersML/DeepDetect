@@ -109,43 +109,42 @@ def _label_to_int(v: Any) -> int:
     raise ValueError(f"Unrecognized label value: {v}")
 
 def load_validation_texts(n_eval: int, seed: int) -> Tuple[List[str], List[int], Dict[int, str]]:
+    # Avoid dill/pickle of ColabKernelApp by disabling caching & keeping everything in RAM
+    from datasets import load_dataset, disable_caching
+    disable_caching()
+    os.environ.setdefault("HF_DATASETS_CACHE", "/tmp/hf_datasets")  # harmless; not used when caching is disabled
+
     rng = random.Random(seed)
 
-    # 1) Non-streaming load (MAGE hosts Arrow files; streaming can fail per-split)
-    ds_all = load_dataset(DATASET_ID)
+    # Non-streaming, in-memory load
+    ds_all = load_dataset(DATASET_ID, keep_in_memory=True)
 
-    # 2) Choose an existing split (prefer validation → test → val → train)
-    for cand in ("validation", "test", "val", "train"):
+    # Prefer validation → test → train
+    for cand in ("validation", "test", "train"):
         if cand in ds_all:
             ds = ds_all[cand]
             break
     else:
-        raise RuntimeError(f"No splits found in {DATASET_ID}")
+        raise RuntimeError(f"No usable split found in {DATASET_ID}")
 
-    # 3) Column detection
+    # Columns
     cols = ds.column_names
     text_col  = next((c for c in CAND_TEXT  if c in cols), cols[0])
     label_col = "label" if "label" in cols else next((c for c in CAND_LABEL if c in cols), None)
     if label_col is None:
         raise RuntimeError(f"Could not infer label column from {cols}")
 
-    # 4) Normalize labels to: 0 = HUMAN, 1 = AI (MAGE is 0=AI,1=HUMAN → invert)
+    # Normalize labels to {0:HUMAN, 1:AI}; MAGE is 0=AI,1=HUMAN → invert
     def norm_label(v: Any) -> int:
         s = str(v).strip().lower()
         if DATASET_ID.lower() == "yaful/mage":
-            try:
-                return 0 if int(v) == 1 else 1
-            except Exception:
-                if s in {"human", "real"}: return 0
-                if s in {"ai", "gpt", "machine"}: return 1
-        else:
-            if s in {"0", "human", "real"}: return 0
-            if s in {"1", "ai", "gpt", "machine"}: return 1
-        raise ValueError(f"Unrecognized label value: {v}")
+            iv = int(v) if s in {"0","1"} else (0 if s in {"ai","gpt","machine"} else 1)
+            return 0 if iv == 1 else 1
+        return 0 if s in {"0","human","real"} else 1
 
-    # 5) Build a roughly balanced sample
+    # Balanced sample
     idxs = list(range(len(ds))); rng.shuffle(idxs)
-    target_pos, target_neg = max(1, n_eval // 2), n_eval - max(1, n_eval // 2)
+    target_pos = max(1, n_eval // 2); target_neg = n_eval - target_pos
     pos, neg = [], []
     for i in idxs:
         t = str(ds[text_col][i])
@@ -155,7 +154,7 @@ def load_validation_texts(n_eval: int, seed: int) -> Tuple[List[str], List[int],
         if len(pos) >= target_pos and len(neg) >= target_neg:
             break
 
-    pooled = (pos[:target_pos] + neg[:target_neg]) or (pos + neg)[:n_eval]
+    pooled = (pos[:target_pos] + neg[:target_neg]) or (pos + neg)
     rng.shuffle(pooled); pooled = pooled[:n_eval]
 
     texts  = [t for t, _ in pooled]

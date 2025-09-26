@@ -626,11 +626,17 @@ def train_eval(cfg: Dict[str, Any]):
 
     # Data
     ds_tok, collator, id2label = load_and_tokenize(cfg, save_root, cfg["max_train"], cfg["max_val"])
+
+    # Drop non-tensor fields (like 'raw_text') during batching for train/val
+    def collate_drop_text(features):
+        feats = [{k: v for k, v in f.items() if k != "raw_text"} for f in features]
+        return collator(feats)
+
     train_dl = DataLoader(
         ds_tok["train"],
         batch_size=cfg["batch_size"],
         shuffle=True,
-        collate_fn=collator,
+        collate_fn=collate_drop_text,
         pin_memory=True,
         num_workers=0,
         persistent_workers=False,
@@ -641,7 +647,7 @@ def train_eval(cfg: Dict[str, Any]):
         ds_tok["validation"],
         batch_size=val_bs,
         shuffle=False,
-        collate_fn=collator,
+        collate_fn=collate_drop_text,
         pin_memory=True,
         num_workers=0,
         persistent_workers=False,

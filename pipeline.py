@@ -4,8 +4,7 @@
 import os, sys, time, json, math, re, gc, importlib, pkgutil, subprocess
 from pathlib import Path
 from typing import Any, Dict
-from transformers import AutoModelForCausalLM  # add near top of file if not already imported
-
+from transformers import AutoModelForCausalLM
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 

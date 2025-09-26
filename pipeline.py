@@ -313,6 +313,36 @@ def json_dump(obj, path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f: json.dump(obj, f, indent=2)
 
+# ----- Persistent run-wide metrics logging (append-only CSV + JSONL) -----
+_METRIC_KEYS = [
+    "run_id","timestamp","event","phase","epoch","step","batch",
+    "loss","loss_avg_window","total_loss","n_steps","acc","f1_macro","auroc","lr",
+    "model_id","dataset","batch_size","grad_accum",
+    "warm_start_used","warm_notes","eval_tag"
+]
+
+def _ensure_perm_logs(root: Path):
+    root.mkdir(parents=True, exist_ok=True)
+    csv_path = root / "metrics.csv"
+    jsonl_path = root / "metrics.jsonl"
+    return csv_path, jsonl_path
+
+def _append_metric(root: Path, row: dict):
+    import csv, os
+    csv_path, jsonl_path = _ensure_perm_logs(root)
+    # Normalize row to canonical schema
+    normalized = {k: row.get(k, None) for k in _METRIC_KEYS}
+    # JSONL append
+    with open(jsonl_path, "a", encoding="utf-8") as jf:
+        jf.write(json.dumps(row, ensure_ascii=False) + "\n")
+    # CSV append (write header if file doesn't exist)
+    write_header = not csv_path.exists()
+    with open(csv_path, "a", newline="", encoding="utf-8") as cf:
+        w = csv.DictWriter(cf, fieldnames=_METRIC_KEYS, extrasaction="ignore")
+        if write_header: w.writeheader()
+        w.writerow(normalized)
+
+
 def safe_load_tokenizer(model_id: str):
     import os, json, re, shutil
     from pathlib import Path
@@ -761,6 +791,16 @@ def train_eval(cfg: Dict[str, Any]):
 
     # Persist warm-start decision for audit
     json_dump({"used": warm_used, "notes": warm_notes, "source": str(best_dir)}, save_root / "warm_start_status.json")
+    _append_metric(save_root, {
+        "run_id": run_id,
+        "timestamp": time.time(),
+        "event": "warm_start_decision",
+        "phase": "setup",
+        "epoch": 0,
+        "step": 0,
+        "warm_start_used": bool(warm_used),
+        "warm_notes": ";".join(warm_notes) if warm_notes else ""
+    })
     log(f"Model ready in {time.time()-t0:.1f}s | hidden_size={hidden_size}", prefix="[MODEL]")
     if warm_notes:
         log("WARM-START notes: " + ", ".join(warm_notes), prefix="[WARM]")
@@ -838,10 +878,12 @@ def train_eval(cfg: Dict[str, Any]):
     best_f1 = -1.0
     t0 = time.time()
     global_step = 0
+    n_steps_seen = 0
+    total_loss_sum = 0.0
     eval_every = int(cfg.get("eval_every", 0)) or 0  # 0 = disabled
 
     # helper to run validation + save best
-    def _do_eval(tag: str):
+    def _do_eval(tag: str, cur_epoch: int):
         nonlocal best_f1
         model.eval()
         valm = evaluate(model, val_dl)
@@ -851,6 +893,20 @@ def train_eval(cfg: Dict[str, Any]):
             f"acc={valm['acc']:.4f} | f1_macro={valm['f1_macro']:.4f} | auroc={valm['auroc']:.4f} | time={elapsed:.1f}m",
             prefix="[EVAL]"
         )
+        _append_metric(save_root, {
+            "run_id": run_id,
+            "timestamp": time.time(),
+            "event": "eval",
+            "phase": "eval",
+            "epoch": int(cur_epoch),
+            "step": int(global_step),
+            "eval_tag": str(tag),
+            "loss": float(valm["loss"]),
+            "acc": float(valm["acc"]),
+            "f1_macro": float(valm["f1_macro"]),
+            "auroc": (None if (valm["auroc"] != valm["auroc"]) else float(valm["auroc"])),
+            "warm_start_used": bool(warm_used)
+        })
         if cfg["wandb"]:
             import wandb
             wandb.log({f"val/{k}": v for k, v in valm.items()} | {"time/min": elapsed, "global_step": global_step})
@@ -890,10 +946,12 @@ def train_eval(cfg: Dict[str, Any]):
 
             with torch.autocast(device_type="cuda", dtype=(torch.bfloat16 if cfg["precision"] == "bf16" else torch.float16)):
                 out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                raw_loss = float(out["loss"].detach().item())
                 loss = out["loss"] / cfg["grad_accum"]
                 logits = out["logits"].detach().float()
                 prob_ai = torch.softmax(logits, dim=-1)[:, 1]
                 pred = logits.argmax(-1)
+
             # accumulate for live train metrics
             ys_run.append(labels.detach().cpu())
             yps_run.append(prob_ai.detach().cpu())
@@ -917,6 +975,24 @@ def train_eval(cfg: Dict[str, Any]):
 
             running += float(loss.item())
             global_step += 1
+            n_steps_seen += 1
+            total_loss_sum += raw_loss
+            _append_metric(save_root, {
+                "run_id": run_id,
+                "timestamp": time.time(),
+                "event": "train_step",
+                "phase": "train",
+                "epoch": epoch,
+                "step": int(global_step),
+                "batch": int(step),
+                "loss": raw_loss,
+                "lr": float(sch.get_last_lr()[0]),
+                "model_id": cfg["model_id"],
+                "dataset": cfg["dataset_id"],
+                "batch_size": cfg["batch_size"],
+                "grad_accum": cfg["grad_accum"],
+                "warm_start_used": bool(warm_used)
+            })
 
             if step % (cfg["grad_accum"] * 5) == 0:
                 avg = running / (cfg["grad_accum"] * 5)
@@ -951,13 +1027,25 @@ def train_eval(cfg: Dict[str, Any]):
 
             # ---- mid-epoch evaluation every N batches ----
             if eval_every and (global_step % eval_every == 0):
-                _do_eval("mid-epoch")
+                _do_eval("mid-epoch", epoch)
 
         # always eval at epoch end (covers tail that didn't hit eval_every)
-        _do_eval(f"epoch={epoch} end")
+        _do_eval(f"epoch={epoch} end", epoch)
 
     log("Training complete.", prefix="[TRAIN]")
+    _append_metric(save_root, {
+        "run_id": run_id,
+        "timestamp": time.time(),
+        "event": "train_end",
+        "phase": "train",
+        "epoch": int(cfg["epochs"]),
+        "step": int(global_step),
+        "total_loss": float(total_loss_sum),
+        "n_steps": int(n_steps_seen),
+        "warm_start_used": bool(warm_used)
+    })
     evaluate_and_save(cfg, best_dir, ds_tok, val_dl, collator, id2label)
+
 
 def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
     import torch, numpy as np
@@ -1093,6 +1181,17 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
         auc = float("nan")
 
     log(f"acc={acc:.4f} | f1_macro={f1m:.4f} | auroc={auc:.4f}", prefix="[BEST]")
+    _append_metric(best_dir.parent, {
+        "run_id": cfg.get("run_id"),
+        "timestamp": time.time(),
+        "event": "eval_best",
+        "phase": "eval",
+        "epoch": None,
+        "step": None,
+        "acc": float(acc),
+        "f1_macro": float(f1m),
+        "auroc": (None if (auc != auc) else float(auc))
+    })
 
     # Error analysis: print up to 20 misclassified examples with confidence
     mis_idx = np.where(yhat != y)[0].tolist()
@@ -1172,6 +1271,7 @@ def main():
 
     # 3) Config
     cfg = {"project": "deepfake-detect-gemma3", "precision": precision, **DEFAULT_CFG}
+    cfg["run_id"] = cfg.get("run_id") or time.strftime("%Y%m%d-%H%M%S")
     hline("[CFG]")
     log(json.dumps(cfg, indent=2))
 

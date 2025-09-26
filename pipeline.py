@@ -21,9 +21,6 @@ DEFAULT_CFG = {
     "epochs": 1,
     "batch_size": 2,
     "grad_accum": 1,
-    "lr": 2e-4,
-    "weight_decay": 0.01,
-    "warmup_ratio": 0.03,
     "max_grad_norm": 1.0,
     "use_lora": True,  # QLoRA on by default
     # include MLP projections too (Gemma/Llama style names)

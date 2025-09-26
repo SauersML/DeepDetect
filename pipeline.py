@@ -743,7 +743,7 @@ def train_eval(cfg: Dict[str, Any]):
         if cfg.get("warm_start", True) and best_dir.exists():
             if cfg["use_lora"] and (best_dir / "lora_adapter").exists():
                 log("WARM-START: loading previous LoRA adapter", prefix="[WARM]")
-                backbone = PeftModel.from_pretrained(base, str(best_dir / "lora_adapter"))
+                backbone = PeftModel.from_pretrained(base, str(best_dir / "lora_adapter"), is_trainable=True)
                 warm_used = True
             elif (not cfg["use_lora"]) and (best_dir / "backbone").exists():
                 log("WARM-START: loading previous finetuned backbone", prefix="[WARM]")
@@ -1148,7 +1148,7 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
             attn_impl=cfg.get("attn_impl"),
             gradient_checkpointing=False,
         )
-        backbone = PeftModel.from_pretrained(base, str(best_dir / "lora_adapter"))
+        backbone = PeftModel.from_pretrained(base, str(best_dir / "lora_adapter"), is_trainable=True)
         # Keep numerically sensitive ops (e.g., LayerNorm) in fp32 for k-bit eval
         backbone = prepare_model_for_kbit_training(backbone, use_gradient_checkpointing=False)
     else:

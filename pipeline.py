@@ -43,23 +43,29 @@ DEFAULT_CFG = {
     "warm_start": True,
 }
 
-RUNS = [
-    {
+# ---- Global run toggles ----
+RUN_GEMMA3 = True
+RUN_HERMES = True
+
+RUNS = []
+if RUN_GEMMA3:
+    RUNS.append({
         "model_id": "google/gemma-3-1b-pt",
         "save_dir": "./runs/gemma-3-1b-pt",
         "epochs": 1,
         "batch_size": 16,
         "gradient_checkpointing": False
-    },
-    {
+    })
+if RUN_HERMES:
+    RUNS.append({
         "model_id": "NousResearch/Hermes-3-Llama-3.1-8B",
         "save_dir": "./runs/Hermes-3-Llama-3.1-8B",
         "epochs": 1,                     # shorter run
         "batch_size": 8,                 # safer for 8B QLoRA
         "grad_accum": 2,                 # keep effective batch size reasonable
         "gradient_checkpointing": True   # reduce memory
-    }
-]
+    })
+
 
 import contextlib
 
@@ -477,7 +483,9 @@ def safe_load_backbone(
     if device_map is None:
         device_map = {"": 0}
 
-    cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=trust_remote_code)
+    # Allow remote code for Hermes explicitly; otherwise respect the argument.
+    hermes_remote = ("hermes" in model_id.lower())
+    cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=(trust_remote_code or hermes_remote))
     if hasattr(cfg, "auto_map"):
         cfg.auto_map = None
 
@@ -487,17 +495,16 @@ def safe_load_backbone(
         chosen_attn = "eager" if "gemma-3" in model_id.lower() else "sdpa"
     log(f"attn_implementation={chosen_attn}", prefix="[MODEL]")
 
-    # >>> disable PEFT autoload only for this call <<<
-    with _disable_peft_autoload():
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            config=cfg,
-            quantization_config=quant,
-            torch_dtype=(None if quant else base_dtype),
-            device_map=device_map,
-            trust_remote_code=trust_remote_code,
-            attn_implementation=chosen_attn,
-        )
+    # Load backbone directly (do not suppress PEFT autoload here).
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        config=cfg,
+        quantization_config=quant,
+        torch_dtype=(None if quant else base_dtype),
+        device_map=device_map,
+        trust_remote_code=(trust_remote_code or hermes_remote),
+        attn_implementation=chosen_attn,
+    )
 
     # training-time prefs
     model.config.output_hidden_states = False
@@ -507,6 +514,7 @@ def safe_load_backbone(
             gradient_checkpointing_kwargs={"use_reentrant": False}
         )
     return model
+
 
 def load_and_tokenize(cfg: Dict[str, Any], save_root: Path, max_train=0, max_val=0):
     disable_hf_transfer()

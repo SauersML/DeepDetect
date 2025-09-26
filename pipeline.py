@@ -1205,8 +1205,21 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
 
     # Build an eval DataLoader that preserves raw_text for error analysis
     def collate_keep_text(features):
+        """
+        Collate function that preserves the original raw text strings for analysis
+        while ensuring the HF DataCollator only sees tensor-able fields.
+        """
+        # stash the strings so the collator never touches them
         texts = [f.get("raw_text", "") for f in features]
-        batch = collator(features)
+    
+        # keep only fields that should be padded/stacked into tensors
+        TENSOR_KEYS = {"input_ids", "attention_mask", "labels", "token_type_ids"}
+        clean = [{k: v for k, v in f.items() if k in TENSOR_KEYS} for f in features]
+    
+        # let the standard collator handle padding/truncation
+        batch = collator(clean)
+    
+        # put the raw strings back for downstream logging/error analysis
         batch["raw_text"] = texts
         return batch
 

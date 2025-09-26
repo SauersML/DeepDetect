@@ -109,17 +109,14 @@ def _label_to_int(v: Any) -> int:
     raise ValueError(f"Unrecognized label value: {v}")
 
 def load_validation_texts(n_eval: int, seed: int) -> Tuple[List[str], List[int], Dict[int, str]]:
-    # Avoid dill/pickle of ColabKernelApp by disabling caching & keeping everything in RAM
-    from datasets import load_dataset, disable_caching
-    disable_caching()
-    os.environ.setdefault("HF_DATASETS_CACHE", "/tmp/hf_datasets")  # harmless; not used when caching is disabled
+    import os, random
+    from datasets import load_dataset
+    os.environ.setdefault("HF_DATASETS_CACHE", "/tmp/hf_datasets")
+    os.environ["HF_DATASETS_DISABLE_PARALLELISM"] = "1"
 
     rng = random.Random(seed)
+    ds_all = load_dataset(DATASET_ID)  # <- no keep_in_memory
 
-    # Non-streaming, in-memory load
-    ds_all = load_dataset(DATASET_ID, keep_in_memory=True)
-
-    # Prefer validation → test → train
     for cand in ("validation", "test", "train"):
         if cand in ds_all:
             ds = ds_all[cand]
@@ -127,14 +124,15 @@ def load_validation_texts(n_eval: int, seed: int) -> Tuple[List[str], List[int],
     else:
         raise RuntimeError(f"No usable split found in {DATASET_ID}")
 
-    # Columns
+    CAND_TEXT  = ["text","content","document","body","sentence","prompt","input","inputs","article"]
+    CAND_LABEL = ["label","labels","target","class","gold","source"]
+
     cols = ds.column_names
     text_col  = next((c for c in CAND_TEXT  if c in cols), cols[0])
     label_col = "label" if "label" in cols else next((c for c in CAND_LABEL if c in cols), None)
     if label_col is None:
         raise RuntimeError(f"Could not infer label column from {cols}")
 
-    # Normalize labels to {0:HUMAN, 1:AI}; MAGE is 0=AI,1=HUMAN → invert
     def norm_label(v: Any) -> int:
         s = str(v).strip().lower()
         if DATASET_ID.lower() == "yaful/mage":
@@ -142,13 +140,12 @@ def load_validation_texts(n_eval: int, seed: int) -> Tuple[List[str], List[int],
             return 0 if iv == 1 else 1
         return 0 if s in {"0","human","real"} else 1
 
-    # Balanced sample
     idxs = list(range(len(ds))); rng.shuffle(idxs)
     target_pos = max(1, n_eval // 2); target_neg = n_eval - target_pos
     pos, neg = [], []
     for i in idxs:
-        t = str(ds[text_col][i])
-        if len(t) > MAX_TEXT_CHARS: t = t[:MAX_TEXT_CHARS] + " …"
+        t = str(ds[text_col][i])[:MAX_TEXT_CHARS]
+        if len(t) == 0: t = "EMPTY"
         y = norm_label(ds[label_col][i])
         (pos if y == 1 else neg).append((t, y))
         if len(pos) >= target_pos and len(neg) >= target_neg:
@@ -161,6 +158,7 @@ def load_validation_texts(n_eval: int, seed: int) -> Tuple[List[str], List[int],
     labels = [y for _, y in pooled]
     id2label = {0: "HUMAN", 1: "AI"}
     return texts, labels, id2label
+
 
 # -------------------------------
 # API HELPERS (NO RETRIES)

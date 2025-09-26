@@ -21,7 +21,7 @@ DEFAULT_CFG = {
     "batch_size": 16,
     "grad_accum": 1,
     "gradient_checkpointing": False,
-    "attn_impl": sdpa,
+    "attn_impl": "sdpa",
     "torch_compile": False,
     "log_interval": 50,
     "max_grad_norm": 1.0,

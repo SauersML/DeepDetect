@@ -430,7 +430,7 @@ def safe_load_backbone(model_id: str, base_dtype, quant, *, device_map=None, tru
             device_map=device_map,
             trust_remote_code=trust_remote_code,
             # Gemma-3 prefers eager attention for training
-            attn_implementation="eager",
+            attn_implementation="sdpa",
         )
 
     # training-time prefs

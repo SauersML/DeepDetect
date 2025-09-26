@@ -798,6 +798,7 @@ def train_eval(cfg: Dict[str, Any]):
                 attention_mask=attention_mask,
                 return_dict=True,
                 output_hidden_states=True,
+            )
     
             if hasattr(out, "last_hidden_state") and out.last_hidden_state is not None:
                 h = out.last_hidden_state
@@ -1206,7 +1207,7 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 return_dict=True,
-                output_hidden_states=True,   # <-- key difference
+                output_hidden_states=True,
             )
     
             if hasattr(out, "last_hidden_state") and out.last_hidden_state is not None:

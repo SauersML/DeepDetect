@@ -471,17 +471,7 @@ def load_and_tokenize(cfg: Dict[str, Any], save_root: Path, max_train=0, max_val
     log(f"Splits: {list(ds.keys())}")
     log(f"Train size: {len(ds['train'])}" + (f", Test size: {len(ds['test'])}" if "test" in ds else ""))
 
-    # ensure validation split
-    keys = set(ds.keys())
-    if "validation" not in keys and "val" not in keys:
-        log("No validation split → creating 10% from train", prefix="[DATA]")
-        split = ds["train"].train_test_split(test_size=0.1, seed=cfg["seed"])
-        from datasets import DatasetDict as HF_DatasetDict
-        ds = HF_DatasetDict(train=split["train"], validation=split["test"], **({"test": ds["test"]} if "test" in keys else {}))
-    elif "val" in keys:
-        ds = DatasetDict(train=ds["train"], validation=ds["val"], **({"test": ds["test"]} if "test" in keys else {}))
-
-    # pick columns
+    # pick columns (must be before we create/stratify validation)
     cand_text = ["text","content","document","body","sentence","prompt","input","inputs","article"]
     cand_label = ["label","labels","target","class","gold","source"]
     cols = list(ds["train"].column_names)
@@ -490,6 +480,17 @@ def load_and_tokenize(cfg: Dict[str, Any], save_root: Path, max_train=0, max_val
     assert label_col is not None, f"No label-like column found in {cols}"
     log(f"text_col={text_col} | label_col={label_col}", prefix="[DATA]")
 
+    # ensure validation split (stratified)
+    keys = set(ds.keys())
+    if "validation" not in keys and "val" not in keys:
+        log("No validation split → creating 10% from train (stratified)", prefix="[DATA]")
+        split = ds["train"].train_test_split(test_size=0.1, seed=cfg["seed"], stratify_by_column=label_col)
+        from datasets import DatasetDict as HF_DatasetDict
+        ds = HF_DatasetDict(train=split["train"], validation=split["test"], **({"test": ds["test"]} if "test" in keys else {}))
+    elif "val" in keys:
+        ds = DatasetDict(train=ds["train"], validation=ds["val"], **({"test": ds["test"]} if "test" in keys else {}))
+
+    # label mapping
     feat = ds["train"].features.get(label_col)
     if isinstance(feat, ClassLabel):
         id2label = {i: n.upper() for i, n in enumerate(feat.names)}
@@ -510,20 +511,26 @@ def load_and_tokenize(cfg: Dict[str, Any], save_root: Path, max_train=0, max_val
             return {"human":0,"real":0,"ai":1,"gpt":1,"machine":1}[s]
         return int(v)
 
-    # subsample
+    # subsample (stratified when we can)
     auto_max_train = int(os.environ.get("AUTO_MAX_TRAIN", "20000"))
     auto_max_val   = int(os.environ.get("AUTO_MAX_VAL",   "2000"))
     disable_auto   = os.environ.get("AUTO_SUBSAMPLE", "1") in {"0", "false", "False"}
-    
-    def maybe_take(ds_split, nmax, fallback):
+
+    def maybe_take_stratified(ds_split, nmax, fallback):
         limit = nmax if (nmax and nmax > 0) else (0 if disable_auto else fallback)
         if limit and len(ds_split) > limit:
-            log(f"Auto-subsample → {limit} rows (set AUTO_SUBSAMPLE=0 to disable)", prefix="[DATA]")
-            return ds_split.shuffle(seed=cfg["seed"]).select(range(limit))
+            log(f"Auto-subsample (stratified) → {limit} rows (set AUTO_SUBSAMPLE=0 to disable)", prefix="[DATA]")
+            try:
+                # Use train_test_split with an integer size and stratification to pick a balanced subset
+                sub = ds_split.train_test_split(test_size=limit, seed=cfg["seed"], stratify_by_column=label_col)["test"]
+                return sub
+            except Exception as e:
+                log(f"Stratified subsample failed ({e}) → falling back to shuffled head", prefix="[DATA]")
+                return ds_split.shuffle(seed=cfg["seed"]).select(range(limit))
         return ds_split
-    
-    ds["train"] = maybe_take(ds["train"], max_train, auto_max_train)
-    ds["validation"] = maybe_take(ds["validation"], max_val, auto_max_val)
+
+    ds["train"] = maybe_take_stratified(ds["train"], max_train, auto_max_train)
+    ds["validation"] = maybe_take_stratified(ds["validation"], max_val, auto_max_val)
     log(f"Using: train={len(ds['train'])}, val={len(ds['validation'])}", prefix="[DATA]")
 
     tok = safe_load_tokenizer(cfg["model_id"])
@@ -534,6 +541,7 @@ def load_and_tokenize(cfg: Dict[str, Any], save_root: Path, max_train=0, max_val
     def tok_fn(batch):
         enc = tok(batch[text_col], truncation=True, max_length=max_len)
         enc["labels"] = [map_label_value(v) for v in batch[label_col]]
+        enc["raw_text"] = batch[text_col]
         return enc
 
     log("Tokenizing …", prefix="[DATA]")
@@ -548,7 +556,6 @@ def load_and_tokenize(cfg: Dict[str, Any], save_root: Path, max_train=0, max_val
 
     from transformers import DataCollatorWithPadding
     collator = DataCollatorWithPadding(tokenizer=tok)
-    from collections import Counter
     y_counts = Counter(ds_tok["train"]["labels"])
     log("Label dist (train): " + str({id2label[k]: v for k, v in sorted(y_counts.items())}), prefix="[DATA]")
 

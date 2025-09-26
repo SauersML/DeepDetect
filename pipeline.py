@@ -1287,6 +1287,7 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
     log(f"[EVAL] Using split=validation | n={len(eval_ds)} | batch_size={max(1, cfg['batch_size']*2)}", prefix="")
 
     ys, yps, yhats, texts_all = [], [], [], []
+    feats_all = []
     pbar = tqdm(loader, desc="Eval(best)", unit="batch", leave=False)
     for batch in pbar:
         input_ids = batch["input_ids"].to(device, non_blocking=True)
@@ -1298,7 +1299,28 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
         from torch.amp import autocast
         # Disable autocast for fp16 (pre-Ampere) to avoid instability; keep it on for bf16.
         with torch.no_grad(), autocast('cuda', dtype=base_dtype, enabled=(cfg["precision"] == "bf16")):
-            logits = model(input_ids=input_ids, attention_mask=attention_mask).float()
+            # Extract pooled hidden state (will be saved for PCA/t-SNE later)
+            base_model = getattr(model.backbone, "base_model", model.backbone)
+            encoder = getattr(base_model, "model", base_model)
+            out = encoder(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                return_dict=True,
+                output_hidden_states=True,
+            )
+            if hasattr(out, "last_hidden_state") and out.last_hidden_state is not None:
+                h = out.last_hidden_state
+            elif getattr(out, "hidden_states", None) is not None:
+                h = out.hidden_states[-1]
+            else:
+                h = model.backbone.get_input_embeddings()(input_ids)
+            if attention_mask is not None:
+                _mask = attention_mask.unsqueeze(-1).type_as(h)
+                pooled = (h * _mask).sum(1) / _mask.sum(1).clamp(min=1.0)
+            else:
+                pooled = h[:, -1]
+            logits = model.cls(pooled).float()
+            feats_all.append(pooled.detach().float().cpu())
 
         # Debug & sanitize logits
         if not torch.isfinite(logits).all():
@@ -1381,6 +1403,7 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
     mis_idx = np.where(yhat != y)[0].tolist()
     log(f"[EVAL] Misclassified examples: {len(mis_idx)}", prefix="")
     max_print = min(20, len(mis_idx))
+    rows = []
     for i in range(max_print):
         j = mis_idx[i]
         gold = int(y[j]); pred_lbl = int(yhat[j]); conf = float(p[j])
@@ -1390,12 +1413,39 @@ def evaluate_and_save(cfg, best_dir: Path, ds_tok, val_dl, collator, id2label):
         if len(snippet) > 300:
             snippet = snippet[:300]
         log(f"[ERR] gold={gold_name} pred={pred_name} p(class==1)={conf:.4f} | text={snippet}", prefix="")
+        rows.append({
+            "idx": int(j),
+            "gold_int": gold,
+            "gold_name": gold_name,
+            "pred_int": pred_lbl,
+            "pred_name": pred_name,
+            "prob_ai": conf,
+            "text_snippet": snippet
+        })
+    # Save a CSV sheet with the top 20 misclassifications
+    import csv
+    pred_dir = best_dir / "preds"
+    pred_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = pred_dir / "misclassified_top20.csv"
+    with open(csv_path, "w", newline="", encoding="utf-8") as cf:
+        w = csv.DictWriter(cf, fieldnames=["idx","gold_int","gold_name","pred_int","pred_name","prob_ai","text_snippet"])
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+    log(f"[EVAL] Saved top-20 misclassifications → {csv_path}", prefix="")
 
     # Save predictions and both metric flavors (argmax + thresholded)
     pred_dir = best_dir / "preds"; pred_dir.mkdir(parents=True, exist_ok=True)
     np.save(pred_dir / "val_labels.npy", y)
     np.save(pred_dir / "val_prob_ai.npy", p)  # NOTE: p is P(class==1)
     np.save(pred_dir / "val_pred.npy", yhat)  # argmax predictions
+    # Save pooled representations for later PCA / t-SNE
+    try:
+        X = torch.cat(feats_all, dim=0).cpu().numpy()
+    except Exception:
+        import numpy as _np
+        X = _np.concatenate([f.numpy() for f in feats_all], axis=0)
+    np.savez(pred_dir / "val_repr_for_viz.npz", X=X, y=y, p=p, yhat=yhat)
 
     # Argmax baseline
     json_dump({"acc": acc, "f1_macro": f1m, "auroc": auc, "class_counts": counts_map}, pred_dir / "metrics.json")

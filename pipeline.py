@@ -39,7 +39,7 @@ DEFAULT_CFG = {
     "max_val": 200,
     "wandb": False,
     "eval_every": 0,
-    "eval_only": False,
+    "eval_only": True,
     "warm_start": True,
 }
 
